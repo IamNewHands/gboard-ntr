@@ -21,3 +21,13 @@
 - `python tests/test_lang_key.py`：12 项 OK（键 ID 唯一、定位器不按几何/顺序、九键与 26 键互不冒领、纯视觉覆盖、存档先于清除、撤键只还原同一身份、守卫顺序、不碰键帽外观、两字只差透明度、语言判据、四处刷新两处撤键、宽限有界且可还原）。
 - `python tests/test_action_key.py`：26 项 OK；`python tests/test_perf.py`：42 项 OK。
 - 未覆盖：本机无 iOS clang/SDK，未本地编译；未在真机安装。中/英两字的实际观感、切语言后高亮跟随、九键分页快速切换是否还闪，均需用户自签后验收。
+
+## 2026-11-22 构建与出包
+
+- CI run 44986819186（提交 dcf13a8）**失败**：`dylib/gkx.m:689:70: error: property 'primaryLanguage' not found on object of type 'id<UITextDocumentProxy>'` —— SDK 的 `UITextDocumentProxy` 协议没有声明该属性，直接点属性编译不过。
+- 修法（提交 6a86c2c）：新增 `@protocol GXKPrimaryLanguageProviding` 只声明 `- (NSString *)primaryLanguage;`，先用 `respondsToSelector:@selector(primaryLanguage)` 探测再发消息；取不到时退回公开声明的 `vc.textInputMode.primaryLanguage`，仍取不到才沿用上次判定。契约测试同步锁住「不得出现 `textDocumentProxy.primaryLanguage` 点属性写法」。
+- CI run 44988474911（提交 6a86c2c）**success**：build 与 publish 两个 job 都通过，macos-15-intel / arm64 / iOS 12+。
+- 产物：builds 分支 `builds/libgkx-6a86c2c.dylib` 256992 bytes，SHA256 `dd19f4290bacf038b2578ba8f4c7c13a2d023d9f87bad95c16a7848bde71e76e`；`builds/LATEST` = 6a86c2cdd3315b878d98022ea93cb2f44c68b382。
+- Release v1.0 资产 `gboard-ntr-1.0-unsigned.ipa` 35984372 bytes，digest `sha256:8e157b170bd6468a1bc5e1220a9443dd57bf8ec600c193b9e0c1dfd7108ef53e`，2026-11-22T05:14:39Z 发布。
+- 推送方式说明：本机 `git push` 走 schannel 一直报 `SEC_E_NO_CREDENTIALS (0x8009030e)`（curl 直连也是 000，代理不可用）。改用 `/c/Program Files/Git/bin/git.exe -c http.sslBackend=openssl` + gh 凭据助手可正常 fetch/ls-remote；两次提交是通过 GitHub REST（blobs → tree → commit → PATCH ref）推上去的，推完再用同一 git 二进制 fetch 对齐本地。
+
