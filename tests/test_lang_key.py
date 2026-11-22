@@ -182,6 +182,18 @@ class LangKeySourceContracts(unittest.TestCase):
         self.assertIn("GXKClearFlashGrace()", gone)
         self.assertLess(gone.index("GXKDetachActionKey()"), gone.index("GXKClearFlashGrace()"))
 
+    def test_expiry_arms_the_rebind_window_before_deciding_to_hand_back(self):
+        """宽限到点必须先续等待窗、再判要不要还键，否则判据永远是假。
+
+        日志 5：detach 那一刻 GXKClearRebindPending 已经清掉等待窗，4822 到点后
+        gxk_rebind_hold 必然为假，于是当场 updateView 还原生、守卫 own=0/grace=0
+        放行，笑脸一直留到下一次切页。
+        """
+        expire = function_body(self.source, "static void GXKExpireFlashGraceIfNeeded(void) {")
+        note = expire.index("if (!gEmojiSoftKeyView) GXKNoteRebindPending();")
+        self.assertLess(note, expire.index("!gxk_rebind_hold(expired)"))
+        self.assertLess(note, expire.index("updateView]"))
+
     def test_expiry_does_not_hand_the_key_back_while_rebind_is_pending(self):
         """宽限到点不能立刻还键：那一次 updateView 会把原生笑脸画回去。
 

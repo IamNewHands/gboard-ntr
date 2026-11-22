@@ -286,6 +286,38 @@ class ActionKeySourceContracts(unittest.TestCase):
         self.assertIn("label.font ?: GXKNativeKeyFont(body, root)", toolbar)
         self.assertNotIn("arrayWithObject:", toolbar)
 
+    def test_stale_foreground_is_cleared_before_any_structural_early_return(self):
+        """清理必须排在所有早退之前，否则陈旧笑脸会留在图层里，撤按钮那一帧露出来。
+
+        视频取证：每次切页恰好一帧原生笑脸（帧 128 换行 → 129 圆圈 → 130 换行）。
+        原因是模型被换成「换行」后 GXKModelHasNativeActions 为假、切页那一拍九键
+        布局体也已换掉，守卫在这些早退处返回，笑脸就留在图层上靠覆盖按钮遮着；
+        GXKDetachActionKey 摘按钮的那一帧它就上屏。
+        """
+        guard = function_body(self.source, "static void gxk_key_updateView(id self, SEL _cmd) {")
+        clear = guard.index("GXKClearIconImages(icon)")
+        # 刚撤键的那一把必须绕过布局判据：撤键末尾的还原 updateView 正好撞上切页，
+        # 九键布局体已经换掉，要求它在可见体里就等于放行那一帧笑脸。
+        self.assertIn("BOOL justDetached = (key == gFlashKey) && gxk_flash_grace_active(key);", guard)
+        self.assertLess(guard.index("justDetached"), guard.index("GXKNineKeyBodyForKey(key, gCurrentVC.view)"))
+        # 放宽只给这一把：别的键仍要求可见九键体与同窗口。
+        self.assertLess(guard.index("GXKNineKeyBodyForKey(key, gCurrentVC.view)"), clear)
+        self.assertLess(guard.index("key.window != gCurrentVC.view.window"), clear)
+        # 归属与键 ID 判据仍在最前：不是我们的键一律不碰。
+        for earlier in ("key != gGuardKey", "isEqualToString:GXKEmojiKeyID]"):
+            self.assertLess(guard.index(earlier), clear, earlier)
+        # 模型已是「换行」/「收起」时不清：那是正确内容，清掉会让键空一帧。
+        self.assertLess(guard.index("GXKModelHasNativeActions(((id<GXKNativeSoftKeyContent>)key).softKeyDef)"), clear)
+
+    def test_detach_clears_stale_foreground_before_removing_overlay_button(self):
+        """摘按钮之前必须先清陈旧前景：按钮是遮住笑脸的唯一东西。"""
+        detach = function_body(self.source, "static void GXKDetachActionKey(void) {")
+        # 必须现取图层上的那一个 icon：切页这一拍原生会重建 icon，存档的旧对象已经不在图层上。
+        self.assertIn("GXKNativeIconForKey(oldKey)", detach)
+        self.assertIn("GXKClearIconImages(staleIcon)", detach)
+        self.assertLess(detach.index("GXKClearIconImages(staleIcon)"),
+                        detach.index("[oldButton removeFromSuperview]"))
+
     def test_native_icon_write_guard_clears_only_the_bound_key_in_the_same_pass(self):
         """原生 updateView 写完的同一轮清前景，否则下一拍清除前会闪一帧圆圈。"""
         guard = function_body(self.source, "static void gxk_key_updateView(id self, SEL _cmd) {")

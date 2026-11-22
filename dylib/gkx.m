@@ -679,10 +679,14 @@ static void GXKExpireFlashGraceIfNeeded(void) {
     gFlashKey = nil; // 先作废再回调，原生这次重画就是「还原」，守卫不会再搬走。
     gFlashDeadline = 0;
     GXKPunctDiagLog(@"grce exp %@", expired.restorationIdentifier);
+    // 顺序是这段的全部：必须先「续上补绑等待窗」再决定要不要还键。
+    // 撤键那一刻 GXKDetachActionKey 已经清掉了等待窗（它要保证绑定失败时立刻还键），
+    // 于是宽限到点这里若先判 gxk_rebind_hold 再补窗，判据永远是假 —— 这一次 updateView
+    // 就把笑脸画回去，而守卫随后看到 own=0/grace=0 直接放行，圆圈一直留到下一次切页。
+    // 日志 5 的 4822→5031 那 209 毫秒、日志 4 的 9390→10560 那 1.17 秒都是这个顺序造成的。
+    if (!gEmojiSoftKeyView) GXKNoteRebindPending();
     // 到点时若这把键仍是可见的九键表情键、而我们还没有绑定它，就不能还给原生：
-    // 这次 updateView 会把笑脸原样画回去，而补绑要等下一轮主队列才到——中间那段
-    // 就是日志 4 里持续 1.17 秒的圆圈。此时改为继续拦（gxk_rebind_hold），
-    // 键空白一两帧后由补绑接上；等待窗到期仍未绑上才真正交还原生。
+    // 键先空白，由下一轮主队列补绑接上；等待窗到期仍未绑上才真正交还原生。
     if (expired != gEmojiSoftKeyView && !gxk_rebind_hold(expired) &&
         [expired respondsToSelector:@selector(updateView)]) {
         [(id<GXKNativeSoftKeyContent>)expired updateView];
@@ -894,10 +898,20 @@ static void gxk_key_updateView(id self, SEL _cmd) {
     // 刚刚撤过的那把键在很短的宽限窗口里继续清，窗口外一律交还原生。
     if (key != gGuardKey && !gxk_flash_grace_active(key) && !gxk_rebind_hold(key)) return;
     if (![key.restorationIdentifier isEqualToString:GXKEmojiKeyID]) return;
-    if (!GXKNineKeyBodyForKey(key, gCurrentVC.view)) return;
-    if (key.window != gCurrentVC.view.window) return;
+    // 刚被 GXKDetachActionKey 撤掉的那把键要放宽布局判据。撤键末尾会调一次原生
+    // updateView 还原，而切页那一拍九键布局体已经换掉、窗口也可能在变：若这里仍要求
+    // 「在可见九键体里」，守卫就会提前返回，把刚画回来的笑脸原样留在图层上，
+    // 而覆盖按钮此刻已被摘走——视频里每次切页露一帧笑脸（帧 128 换行→129 圆圈→130 换行）
+    // 就是这个提前返回。只对这一把键放宽，别的键判据不变。
+    BOOL justDetached = (key == gFlashKey) && gxk_flash_grace_active(key);
+    if (!justDetached) {
+        if (!GXKNineKeyBodyForKey(key, gCurrentVC.view)) return;
+        if (key.window != gCurrentVC.view.window) return;
+    }
     UIView<GXKNativeIconContent> *icon = GXKNativeIconForKey(key);
     if (!icon) return;
+    // 模型已经不是「原生表情」时，原生这一轮画的是「换行」/「收起」，那是正确内容：
+    // 既不该存档，也不该清掉，否则键会空一帧。
     if (!GXKModelHasNativeActions(((id<GXKNativeSoftKeyContent>)key).softKeyDef)) return;
     // 只有「原生真的把圆圈画回来了」才记一行：正常帧不进环形缓冲，日志才看得清闪烁那几拍。
     if (icon.image || icon.highlightedImage) {
@@ -907,6 +921,8 @@ static void gxk_key_updateView(id self, SEL _cmd) {
     if (icon.image) gActionNormalImage = icon.image;
     if (icon.highlightedImage) gActionHighlightedImage = icon.highlightedImage;
     // 只清前景两态，背景层与原生键帽保持原样；必须瞬时，不能淡出。
+    // 模型已换成「换行」的陈旧笑脸不在这里处理（那一轮原生画的是正确内容，
+    // 清掉会让键空一帧），由 GXKDetachActionKey 在摘按钮之前按图层上的 icon 清掉。
     GXKClearIconImages(icon);
     // 走的是宽限而不是归属：这把键是切页后重建的新实例，还没有人接管它。
     // 立刻补绑一次，别等 0.2 秒轮询——否则用户先看到的是原生圆圈闪一下再变成文字。
@@ -1278,6 +1294,11 @@ static void GXKDetachActionKey(void) {
     gActionSoftKeyDef = nil;
     gActionHost = nil;
     gActionKeyButton = nil;
+    // 摘按钮之前先把键上的陈旧前景清掉：守卫只在「模型还是原生表情」时才清，
+    // 模型换成「换行」之后留下的那颗笑脸会一直躺在图层里，靠覆盖按钮遮着。
+    // 按钮一摘，它就露出来一帧——这是切页闪笑脸的直接来源。
+    UIView<GXKNativeIconContent> *staleIcon = oldKey ? GXKNativeIconForKey(oldKey) : nil;
+    if (staleIcon) GXKClearIconImages(staleIcon);
     [oldButton removeFromSuperview];
     // 切页宽限：这把键刚被撤，原生接下来几帧还会重画它。窗口内守卫继续把原生圆圈搬走，
     // 用户看不到那一帧；窗口一到守卫立即放行并还原前景，不会长期停在没有图标的状态。
