@@ -661,7 +661,12 @@ static BOOL gxk_flash_grace_active(UIView *key) {
     if (!key || CFAbsoluteTimeGetCurrent() >= gFlashDeadline) return NO;
     if (![key.restorationIdentifier isEqualToString:GXKEmojiKeyID]) return NO;
     if (key == gFlashKey) return YES;
-    return gCurrentVC && gCurrentVC.isViewLoaded && GXKNineKeyBodyForKey(key, gCurrentVC.view) != nil;
+    if (!gCurrentVC || !gCurrentVC.isViewLoaded) return NO;
+    if (GXKNineKeyBodyForKey(key, gCurrentVC.view) != nil) return YES;
+    // 切页这一拍「新实例」往往还没落进任何可解析的九键布局体——布局体自己也在换。
+    // 只认布局体的话，这期间新键的原生笑脸没人拦，照原样上屏一帧，正是视频里那一下。
+    // 判据放宽到「键 ID 是九键表情键 + 在当前根视图里可见」，窗口仍然只有 0.6 秒。
+    return [key isDescendantOfView:gCurrentVC.view] && GXKKeyIsVisible(key, gCurrentVC.view);
 }
 
 // 扩展隐藏后没有「正在闪的那一帧」可言：宽限窗口当场作废，下次出现重新按当前布局定位。
@@ -757,7 +762,13 @@ static void gxk_icon_setImage(id self, SEL _cmd, UIImage *image) {
         // 拦下来的图不能丢：撤键那一刻要靠它把原生笑脸写回去，
         // 否则守卫期间归档永远为空，键会空白到宽限结束。
         if (key == gGuardKey) gActionNormalImage = image;
-        GXKPunctDiagLog(@"blk img %@", key.restorationIdentifier);
+        // 不是刚撤的那把、也不是当前归属：说明是切页后重建的新实例被宽限拦下，
+        // 这一行就是「新键的原生笑脸有没有被拦住」的直接证据。
+        if (key != gGuardKey && key != gFlashKey) {
+            GXKPunctDiagLog(@"blk new %@", key.restorationIdentifier);
+        } else {
+            GXKPunctDiagLog(@"blk img %@", key.restorationIdentifier);
+        }
         return;
     }
     if (gOrigIconSetImage) gOrigIconSetImage(self, _cmd, image);
@@ -1313,12 +1324,19 @@ static void GXKDetachActionKey(void) {
         BOOL wasHidden = oldKey.isHidden;
         [(id<GXKNativeSoftKeyContent>)oldKey updateView];
         oldKey.hidden = wasHidden;
+        // 还原只对「已经不在屏幕上的旧键」有意义：那种键要还给原生，下次出现时原生自己会画。
+        // 仍可见的键绝不能在这里写回笑脸——按钮刚在上一行被摘走，写回的这张图正好露出那一帧，
+        // 就是视频里每次切页「换行 → 圆圈 → 换行」的那一帧（日志里 det emoji 后紧跟的
+        // blk img 已经证明原生那次重画被拦住了，屏幕上剩下的笑脸只能来自这里）。
+        // 真的绑定失败、键要永久还给原生时，宽限到点的自愈路径会替它调一次原生 updateView。
+        BOOL offscreen = (oldKey.window == nil) || oldKey.isHidden;
         // 只有同一emoji/model/icon可用保留的前景；不能回写到复用成回车的新模型。
         // updateView已证恢复normal image，但highlightedImage未获相同证明。
-        if ([oldKey.restorationIdentifier isEqualToString:GXKEmojiKeyID] &&
+        if (offscreen && [oldKey.restorationIdentifier isEqualToString:GXKEmojiKeyID] &&
             GXKNativeIconForKey(oldKey) == oldIcon &&
             ((id<GXKNativeSoftKeyContent>)oldKey).softKeyDef == oldModel) {
             gxk_icon_write_bypass = YES;
+            if (normalImage) GXKPunctDiagLog(@"wr back %@", oldKey.restorationIdentifier);
             if (!oldIcon.image && normalImage) oldIcon.image = normalImage;
             if (!oldIcon.highlightedImage && highlightedImage) oldIcon.highlightedImage = highlightedImage;
             gxk_icon_write_bypass = NO;

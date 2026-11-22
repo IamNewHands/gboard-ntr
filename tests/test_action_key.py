@@ -442,6 +442,29 @@ class ActionKeySourceContracts(unittest.TestCase):
         self.assertIn("UIViewController *vc = weakVC", changed)
         self.assertIn("vc == gCurrentVC", changed)
 
+    def test_grace_covers_rebuilt_key_and_detach_never_repaints_a_visible_key(self):
+        """宽限要盖住「切页后重建的新实例」，撤键不得把笑脸写回仍可见的键。
+
+        日志 6 取证：每次切页都是 det emoji → blk img（原生重画被拦）→ 3 毫秒后
+        hit new key，而屏幕上仍然露出那一帧笑脸。两条同时成立：
+        1. 新实例还没落进可解析的九键布局体，旧判据只认布局体，于是新键没人拦；
+        2. 撤键末尾把存档的笑脸写回旧键，而按钮刚在上面被摘走，写回的正是那一帧。
+        """
+        grace = function_body(self.source, "static BOOL gxk_flash_grace_active(UIView *key) {")
+        # 布局体判据仍在（正常路径优先），但不再是唯一出路：布局体换了的时候还要认可见性。
+        self.assertLess(grace.index("GXKNineKeyBodyForKey(key, gCurrentVC.view) != nil"),
+                        grace.index("GXKKeyIsVisible(key, gCurrentVC.view)"))
+        self.assertIn("return [key isDescendantOfView:gCurrentVC.view] && GXKKeyIsVisible(key, gCurrentVC.view);",
+                      grace)
+        detach = function_body(self.source, "static void GXKDetachActionKey(void) {")
+        # 还原只给已经不在屏幕上的旧键：可见的键写回笑脸，露出来的就是那一帧。
+        self.assertIn("BOOL offscreen = (oldKey.window == nil) || oldKey.isHidden;", detach)
+        self.assertLess(detach.index("BOOL offscreen"), detach.index("oldIcon.image = normalImage"))
+        self.assertLess(detach.index("if (offscreen &&"),
+                        detach.index("oldIcon.image = normalImage"))
+        # 按钮必须先摘、还原必须留到最后：反过来就是「先把笑脸写回、再撤遮挡」。
+        self.assertLess(detach.index("GXKClearIconImages(staleIcon)"),
+                        detach.index("[oldButton removeFromSuperview]"))
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
