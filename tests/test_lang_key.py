@@ -120,8 +120,15 @@ class LangKeySourceContracts(unittest.TestCase):
         self.assertEqual(title.count("colorWithAlphaComponent"), 1)
 
     def test_language_judgement_prefers_host_language_and_keeps_last(self):
+        # SDK 的 UITextDocumentProxy 协议没有声明 primaryLanguage（CI 上直接点属性会编译失败），
+        # 必须按协议探测后再发消息。
+        probe = function_body(self.source, "static NSString *GXKLangCurrentLanguage(UIViewController *vc) {")
+        self.assertIn("respondsToSelector:@selector(primaryLanguage)", probe)
+        self.assertIn("GXKPrimaryLanguageProviding", probe)
+        self.assertIn("textInputMode.primaryLanguage", probe)
+        self.assertNotIn("textDocumentProxy.primaryLanguage", probe)
         judge = function_body(self.source, "static BOOL GXKLangCurrentIsChinese(UIViewController *vc) {")
-        self.assertIn("primaryLanguage", judge)
+        self.assertIn("GXKLangCurrentLanguage(vc)", judge)
         self.assertIn('hasPrefix:@"zh"', judge)
         # 取不到语言时沿用上次判定，避免无谓闪动。
         self.assertIn("return gLangChinese", judge)

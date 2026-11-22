@@ -684,9 +684,27 @@ static UIView *GXKFindLangKey(UIView *root) {
 }
 
 // 语言判据：宿主给的输入语言优先；取不到就沿用上一次判定，避免无谓闪动。
+// 注意 SDK 的 UITextDocumentProxy 协议里没有声明 primaryLanguage（编译期取不到这个属性），
+// 但宿主对象运行时确实实现了它，所以按协议探测后再发消息，不直接点属性。
+@protocol GXKPrimaryLanguageProviding <NSObject>
+- (NSString *)primaryLanguage;
+@end
+
+static NSString *GXKLangCurrentLanguage(UIViewController *vc) {
+    id proxy = ((UIInputViewController *)vc).textDocumentProxy;
+    if ([proxy respondsToSelector:@selector(primaryLanguage)]) {
+        NSString *lang = [(id<GXKPrimaryLanguageProviding>)proxy primaryLanguage];
+        if ([lang isKindOfClass:[NSString class]] && lang.length >= 2) return lang;
+    }
+    // 退路：UIResponder 的 textInputMode 是公开声明，同样带 primaryLanguage。
+    NSString *modeLang = vc.textInputMode.primaryLanguage;
+    if ([modeLang isKindOfClass:[NSString class]] && modeLang.length >= 2) return modeLang;
+    return nil;
+}
+
 static BOOL GXKLangCurrentIsChinese(UIViewController *vc) {
     if (![vc isKindOfClass:[UIInputViewController class]]) return gLangChinese;
-    NSString *lang = ((UIInputViewController *)vc).textDocumentProxy.primaryLanguage;
+    NSString *lang = GXKLangCurrentLanguage(vc);
     if (![lang isKindOfClass:[NSString class]] || lang.length < 2) return gLangChinese;
     return [lang.lowercaseString hasPrefix:@"zh"];
 }
