@@ -692,7 +692,14 @@ static void GXKExpireFlashGraceIfNeeded(void) {
     if (!gEmojiSoftKeyView) GXKNoteRebindPending();
     // 到点时若这把键仍是可见的九键表情键、而我们还没有绑定它，就不能还给原生：
     // 键先空白，由下一轮主队列补绑接上；等待窗到期仍未绑上才真正交还原生。
-    if (expired != gEmojiSoftKeyView && !gxk_rebind_hold(expired) &&
+    // 判据不能只有「在可见九键体里」：切页过渡这一拍布局体自己也在换，
+    // 判据不成立就放行，这一趟 updateView 画出来的原生笑脸正好落在没有按钮的键上
+    // ——日志 7 的 31554/39019 两次 grce exp 之后就是这种 own=0 grace=0 的重画。
+    BOOL expiredVisible = gCurrentVC && gCurrentVC.isViewLoaded &&
+                          [expired isDescendantOfView:gCurrentVC.view] &&
+                          GXKKeyIsVisible(expired, gCurrentVC.view);
+    BOOL holdOff = gxk_rebind_hold(expired) || (expiredVisible && gxk_rebind_pending());
+    if (expired != gEmojiSoftKeyView && !holdOff &&
         [expired respondsToSelector:@selector(updateView)]) {
         [(id<GXKNativeSoftKeyContent>)expired updateView];
     }
@@ -1867,6 +1874,21 @@ static void GXKUpdateActionKey(UIViewController *vc);
 
 static GXKActionKeyTarget *gActionTarget;
 
+// 一次定位失败不等于「这把键不该接管」。切页过渡里九键布局体自己也在换，
+// GXKFindNineKeyEmojiKey 会有一两拍返回 nil；照旧撤键的话，按钮要等下一次定位成功
+// 才回到屏幕上。日志 7 里 det emoji 之后 3~5 毫秒才 hit new key，这几毫秒键上没有按钮，
+// 慢速切页时看到的就是「换行文字闪一下」；快速连切时定位连续失败，空档更长，
+// 原生就在这段没有归属的时间里把笑脸画回可见键上。
+// 旧键实例仍在当前根视图里可见、模型仍是原生表情、按钮还挂在宿主上，就保留绑定。
+static BOOL GXKKeepLiveBinding(UIView *root) {
+    if (!gEmojiSoftKeyView || !gActionKeyButton || !gActionHost || !gActionSoftKeyDef) return NO;
+    if (!root || ![gEmojiSoftKeyView isDescendantOfView:root]) return NO;
+    if (!GXKKeyIsVisible(gEmojiSoftKeyView, root)) return NO;
+    if (gActionKeyButton.superview != gActionHost) return NO;
+    if (![gEmojiSoftKeyView.restorationIdentifier isEqualToString:GXKEmojiKeyID]) return NO;
+    return GXKModelHasNativeActions(gActionSoftKeyDef);
+}
+
 static void GXKUpdateActionKey(UIViewController *vc) {
     if (gUpdatingActionKey || !vc || vc != gCurrentVC || !vc.isViewLoaded) return;
     gUpdatingActionKey = YES;
@@ -1922,6 +1944,12 @@ static void GXKUpdateActionKey(UIViewController *vc) {
     id model = icon ? ((id<GXKNativeSoftKeyContent>)currentKey).softKeyDef : nil;
     UIColor *color = icon.foregroundColor;
     if (!currentKey || !icon || !GXKModelHasNativeActions(model) || ![color isKindOfClass:[UIColor class]]) {
+        // 切页过渡里这一拍可能只是定位不到，不是真的换了布局：保留仍可见的旧绑定，
+        // 按钮就不会消失，原生也没机会在这段空档里把笑脸画回来。
+        if (GXKKeepLiveBinding(root)) {
+            gUpdatingActionKey = NO;
+            return;
+        }
         GXKDetachActionKey(); // 26键、未知/不完整布局完全保持原生，不猜测替代键。
         gUpdatingActionKey = NO;
         return;
@@ -1933,8 +1961,16 @@ static void GXKUpdateActionKey(UIViewController *vc) {
         gUpdatingActionKey = NO;
         return;
     }
-    if (gEmojiSoftKeyView != currentKey || gActionNativeIcon != icon || gActionSoftKeyDef != model ||
-        !gActionKeyButton || gActionKeyButton.superview != host) {
+    // 同一个键、同一个模型，只是原生把前景图标对象重建了（切页/主题刷新都会这么干）：
+    // 归属本来还在，撤掉再绑只会平白给原生一个「没有归属」的窗口，那几帧就是圆圈。
+    // 直接把归属换到新图标上，走下面同一段收尾（搬走原生刚画的前景、对齐位置与标题）。
+    BOOL iconRebuilt = (gEmojiSoftKeyView == currentKey) && (gActionSoftKeyDef == model) &&
+                       (gActionNativeIcon != icon) && gActionKeyButton &&
+                       gActionKeyButton.superview == host;
+    if (iconRebuilt) gActionNativeIcon = icon;
+    if (!iconRebuilt &&
+        (gEmojiSoftKeyView != currentKey || gActionNativeIcon != icon || gActionSoftKeyDef != model ||
+         !gActionKeyButton || gActionKeyButton.superview != host)) {
         GXKDetachActionKey();
         // 原生updateView会应用布局/可见性属性：重新验证控制器、root及完整当前目标。
         if (vc != gCurrentVC || !vc.isViewLoaded || vc.view != root) {
