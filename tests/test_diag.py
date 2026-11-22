@@ -68,6 +68,18 @@ class DiagSwitchTest(unittest.TestCase):
         self.assertIn("removeFromSuperview", attach)
         self.assertLess(attach.index("GXKPunctDiagEnabled()"), attach.index("UILabel alloc"))
 
+    def test_toggle_updates_the_row_without_reloading_the_page(self) -> None:
+        """点一下就要看到新状态：只重载那一格，不许 reloadData 把整页重建。"""
+        toggle = function_body(self.source, "static void GXKToggleDiagLog(")
+        self.assertIn("reloadItemsAtIndexPaths:", toggle)
+        self.assertNotIn("reloadData", toggle)
+        # 行对象和屏幕上的 cell 未必是同一个，两条路都要写标题。
+        self.assertIn("GXKRelabelDiagViews(", toggle)
+        self.assertIn("cellForItemAtIndexPath:", toggle)
+        self.assertLess(toggle.index("setBool:enabled forKey:"), toggle.index("reloadItemsAtIndexPaths:"))
+        relabel = function_body(self.source, "static void GXKRelabelDiagViews(")
+        self.assertIn('hasPrefix:@"诊断日志"', relabel)
+
     def test_settings_switch_writes_app_group(self) -> None:
         row = function_body(self.source, "static id GXKDiagSettingsRow(")
         self.assertIn("initWithType:settingID:title:accessibilityIdentifier:key:", row)

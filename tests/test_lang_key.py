@@ -148,11 +148,18 @@ class LangKeySourceContracts(unittest.TestCase):
             self.assertIn("GXKDetachLangKey", function_body(self.source, signature), signature)
 
     def test_page_switch_grace_window_is_bounded_and_restores_native(self):
-        """切页宽限只覆盖刚撤的那一把键，到点必须交还原生，不得长期停在无前景。"""
+        """切页宽限按身份生效（重建出来的新实例也算），但必须到点交还原生。"""
         helper = function_body(self.source, "static BOOL gxk_flash_grace_active(UIView *key) {")
+        # 旧实例直接命中；原生切页会重建表情键，新实例只能按「可见九键表情键」认。
         self.assertIn("key == gFlashKey", helper)
-        self.assertIn("CFAbsoluteTimeGetCurrent() < gFlashDeadline", helper)
+        self.assertIn("GXKNineKeyBodyForKey(key, gCurrentVC.view)", helper)
+        # 有界：到点一律放行，绝不能变成长期接管。
+        self.assertIn("CFAbsoluteTimeGetCurrent() >= gFlashDeadline", helper)
         self.assertIn("GXKEmojiKeyID", helper)
+        # 宽限不能在空转 detach 里被清零：那会让守卫在刚建立的窗口上当场放行。
+        detach_head = function_body(self.source, "static void GXKDetachActionKey(void) {")
+        early = detach_head.index("if (!gEmojiSoftKeyView && !gActionKeyButton")
+        self.assertLess(early, detach_head.index("gFlashDeadline = oldKey ?"))
         guard = function_body(self.source, "static void gxk_key_updateView(id self, SEL _cmd) {")
         self.assertIn("key != gGuardKey && !gxk_flash_grace_active(key)", guard)
         # 宽限不能变成第二条归属：守卫仍要求键 ID 是九键表情键。

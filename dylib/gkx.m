@@ -556,9 +556,29 @@ static void gxk_lang_updateView(UIView *key);
 static __weak UIView *gFlashKey;
 static CFTimeInterval gFlashDeadline;
 
+// 宽限里被重建的新键没有归属，光靠 0.2 秒轮询要等两三拍才绑上，那几拍一直走守卫清图，
+// 手感上就是「切页后动作键反应慢半拍」。这里在守卫内部预约一次下一轮主队列的补绑：
+// 一帧只排一次，不在原生 updateView 的调用栈里做全树定位。
+static BOOL gRebindScheduled = NO;
+static void GXKScheduleActionKeyRebind(void) {
+    if (gRebindScheduled) return;
+    gRebindScheduled = YES;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        gRebindScheduled = NO;
+        UIViewController *vc = gCurrentVC;
+        if (vc && vc.isViewLoaded) GXKUpdateActionKey(vc);
+    });
+}
+
+// 宽限按「身份」而不是「实例」生效：切页这一拍原生会把表情键整个重建，
+// 旧实例已经不可见，新实例还没有归属。只认实例的宽限会让新键的第一帧原生圆圈直接上屏——
+// 那正是用户看到的闪圈（旧键被清掉了，新键没人管）。
+// 判据仍是三重：键 ID 是九键表情键、确实在可见九键布局体里、窗口还没到点。
 static BOOL gxk_flash_grace_active(UIView *key) {
-    return key && key == gFlashKey && CFAbsoluteTimeGetCurrent() < gFlashDeadline &&
-           [key.restorationIdentifier isEqualToString:GXKEmojiKeyID];
+    if (!key || CFAbsoluteTimeGetCurrent() >= gFlashDeadline) return NO;
+    if (![key.restorationIdentifier isEqualToString:GXKEmojiKeyID]) return NO;
+    if (key == gFlashKey) return YES;
+    return gCurrentVC && gCurrentVC.isViewLoaded && GXKNineKeyBodyForKey(key, gCurrentVC.view) != nil;
 }
 
 // 扩展隐藏后没有「正在闪的那一帧」可言：宽限窗口当场作废，下次出现重新按当前布局定位。
@@ -578,6 +598,9 @@ static void GXKExpireFlashGraceIfNeeded(void) {
     if (expired != gEmojiSoftKeyView && [expired respondsToSelector:@selector(updateView)]) {
         [(id<GXKNativeSoftKeyContent>)expired updateView];
     }
+    // 窗口到点时若仍没有归属，说明原生把键重建成了新实例、轮询又刚好停表：
+    // 下一轮补绑一次，别让键停在没有前景的状态等到下一次布局。
+    if (!gEmojiSoftKeyView) GXKScheduleActionKeyRebind();
 }
 // 诊断用：这把键是不是我们接管的那两把（九键表情键、齿轮键）。
 // 单独成函数，是为了让守卫主体里的判据顺序保持原样（先认归属/宽限，再认键 ID）。
@@ -628,6 +651,9 @@ static void gxk_key_updateView(id self, SEL _cmd) {
     // 只清前景两态，背景层与原生键帽保持原样。
     if (icon.image) icon.image = nil;
     if (icon.highlightedImage) icon.highlightedImage = nil;
+    // 走的是宽限而不是归属：这把键是切页后重建的新实例，还没有人接管它。
+    // 立刻补绑一次，别等 0.2 秒轮询——否则用户先看到的是原生圆圈闪一下再变成文字。
+    if (!gEmojiSoftKeyView) GXKScheduleActionKeyRebind();
 }
 
 // 齿轮键守卫：原生重画会把 globe 图标写回前景，同一趟里先存档再清。
@@ -944,6 +970,10 @@ static void GXKUpdateLangKey(UIViewController *vc) {
 }
 
 static void GXKDetachActionKey(void) {
+    // 空转必须早退：切页那一串原生刷新里 detach 会被连调十几次，每次都没有绑定。
+    // 更关键的是下面的 gFlashDeadline 赋值——没有旧键时它会把刚建立的宽限窗口清零，
+    // 于是守卫当场放行，新键的原生圆圈照原样提交一帧。宽限只能由真正的撤键建立。
+    if (!gEmojiSoftKeyView && !gActionKeyButton && !gActionNativeIcon && !gActionSoftKeyDef) return;
     BOOL wasUpdating = gUpdatingActionKey;
     gUpdatingActionKey = YES; // 原生refresh引起布局回调时不能重新绑定正在释放的按钮。
     UIView *oldKey = gEmojiSoftKeyView;
@@ -2907,23 +2937,44 @@ static id GXKDescriptorRowAt(id self, id indexPath) {
 
 // 点「诊断日志」那一行：就地翻转 App Group 里的开关，键盘侧半秒内跟上。
 // 键盘扩展里 HUD 只读这个值，所以主 App 关掉之后键盘不需要重启。
+// 就地改标题：descriptor 里那一行改完，屏幕上的 cell 未必跟着刷新——
+// 上屏的 descriptor 可能是 mainMenuPageDescriptor 的副本，行对象和 cell 不是同一个。
+// 所以先按「诊断日志」前缀把可见 UILabel 全部改写，用户松手那一帧就看到新状态。
+static void GXKRelabelDiagViews(UIView *view, NSString *title, NSUInteger depth) {
+    if (!view || depth > 10) return;
+    if ([view isKindOfClass:[UILabel class]]) {
+        UILabel *label = (UILabel *)view;
+        if ([label.text hasPrefix:@"诊断日志"]) label.text = title;
+    }
+    for (UIView *child in view.subviews) GXKRelabelDiagViews(child, title, depth + 1);
+}
+
 static void GXKToggleDiagLog(id self, id collectionView, id indexPath) {
     NSUserDefaults *defaults = [[NSUserDefaults alloc] initWithSuiteName:GXKGroup];
     if (!defaults) defaults = [NSUserDefaults standardUserDefaults];
     BOOL enabled = ![defaults boolForKey:GXKDiagLogKey];
     [defaults setBool:enabled forKey:GXKDiagLogKey];
     [defaults synchronize]; // 跨进程，键盘那边要立刻看见。
-    // 行对象在内存里就地改标题；不支持 setTitle: 就只靠重开设置页生效。
+    NSString *title = GXKDiagRowTitle();
+    // 行对象在内存里就地改标题；不支持 setTitle: 就只靠下面的 cell 改写兜底。
     id row = GXKDescriptorRowAt(self, indexPath);
     if ([row respondsToSelector:@selector(setTitle:)]) {
-        ((void (*)(id, SEL, id))objc_msgSend)(row, @selector(setTitle:), GXKDiagRowTitle());
+        ((void (*)(id, SEL, id))objc_msgSend)(row, @selector(setTitle:), title);
     }
+    if ([collectionView respondsToSelector:@selector(cellForItemAtIndexPath:)]) {
+        id cell = ((id (*)(id, SEL, id))objc_msgSend)(
+            collectionView, @selector(cellForItemAtIndexPath:), indexPath);
+        if ([cell isKindOfClass:[UIView class]]) GXKRelabelDiagViews((UIView *)cell, title, 0);
+    }
+    // 取消选中动画会让这一行停在灰色高亮上，看起来像「还没生效」。
     if ([collectionView respondsToSelector:@selector(deselectItemAtIndexPath:animated:)]) {
         ((void (*)(id, SEL, id, BOOL))objc_msgSend)(
             collectionView, @selector(deselectItemAtIndexPath:animated:), indexPath, NO);
     }
-    if ([collectionView respondsToSelector:@selector(reloadData)]) {
-        ((void (*)(id, SEL))objc_msgSend)(collectionView, @selector(reloadData));
+    // 只重载这一格：整页重建会把所有 cell 重新生成，点一下卡一下正是它造成的。
+    if ([collectionView respondsToSelector:@selector(reloadItemsAtIndexPaths:)]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(
+            collectionView, @selector(reloadItemsAtIndexPaths:), @[indexPath]);
     }
     GXK_LOG(@"[*] 诊断日志已%@", enabled ? @"开启" : @"关闭");
 }
