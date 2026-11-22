@@ -29,5 +29,6 @@
 - CI run 44988474911（提交 6a86c2c）**success**：build 与 publish 两个 job 都通过，macos-15-intel / arm64 / iOS 12+。
 - 产物：builds 分支 `builds/libgkx-6a86c2c.dylib` 256992 bytes，SHA256 `dd19f4290bacf038b2578ba8f4c7c13a2d023d9f87bad95c16a7848bde71e76e`；`builds/LATEST` = 6a86c2cdd3315b878d98022ea93cb2f44c68b382。
 - Release v1.0 资产 `gboard-ntr-1.0-unsigned.ipa` 35984372 bytes，digest `sha256:8e157b170bd6468a1bc5e1220a9443dd57bf8ec600c193b9e0c1dfd7108ef53e`，2026-11-22T05:14:39Z 发布。
+- 本机回验：下载 Release 资产（35984372 bytes，zip 可读，2050 个成员）后取出 `Payload/Gboard.app/Frameworks/libgkx.dylib`，256992 bytes，SHA256 `dd19f4290bacf038b2578ba8f4c7c13a2d023d9f87bad95c16a7848bde71e76e` —— 与 builds 分支 `libgkx-6a86c2c.dylib` 逐字节一致。
 - 推送方式说明：本机 `git push` 走 schannel 一直报 `SEC_E_NO_CREDENTIALS (0x8009030e)`（curl 直连也是 000，代理不可用）。改用 `/c/Program Files/Git/bin/git.exe -c http.sslBackend=openssl` + gh 凭据助手可正常 fetch/ls-remote；两次提交是通过 GitHub REST（blobs → tree → commit → PATCH ref）推上去的，推完再用同一 git 二进制 fetch 对齐本地。
 
