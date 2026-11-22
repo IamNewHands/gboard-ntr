@@ -55,11 +55,18 @@ NSExtensionPrincipalClass = "GKBUIInputViewController"
   `test_language_decision_prefers_gboard_language_object`（反射优先于宿主语言、保留 zh 兜底）、
   `test_flash_instrumentation_stays_behind_the_switch`（埋点全走 GXKPunctDiagLog、守卫顺序不乱、原型早于使用）。
 
+### CI 与产物（已完成）
+
+- 提交 `8c8582e`，run [44993577002](https://github.com/IamNewHands/gboard-ntr/actions/runs/44993577002) → **success**（编译 + 换 dylib + 发 Release 全绿）。
+- Release `v1.0` 的 `gboard-ntr-1.0-unsigned.ipa`（35985267 字节）已刷新。
+- 把该 IPA 里的 `Payload/Gboard.app/Frameworks/libgkx.dylib`（257296 字节）抽出来做字符串核对，
+  全部命中：`GKBLanguageID`、`lang src=%@ state=%ld`、`upd %@ own=%d grace=%d`、
+  `gd emoji g=%@`、`gd lang %@`、`det emoji %@`、`grce exp %@`、`lang=language decision`、`isChinese`。
+  → 说明这次改动真的进了安装包，不是只改了源码。
+
 ### 未完成
 
-1. 本机无 iOS clang/SDK，**未本地编译**；只能靠 GitHub Actions（push `dylib/**` 触发）。
-2. 真机验收未做：需要在设置里打开「诊断日志」，切几次中英再长按 HUD 复制日志回传。
-3. 出包未做（CI 产物进 builds 分支后替换 Release IPA 里的 `Frameworks/libgkx.dylib`）。
+- 真机验收（唯一剩余项）：装 Release IPA → 设置里打开「诊断日志」→ 切中英、切页 → 长按 HUD 复制日志回传。
 
 ### 真机验收步骤
 
