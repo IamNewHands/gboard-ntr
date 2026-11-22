@@ -22,6 +22,12 @@
 
 static NSString *const GXKGroup = @"group.zunbengege.top";
 static NSString *const GXKEmojiKeyID = @"key_pos_9keys_emoji";
+// 齿轮键（切语言键）：九键左列第 4 键与 26 键右上角键，原包映射表里都是 softkey_globe，
+// 只有图标没有文字标签，所以整块换成「中/英」不会和任何原生文字打架。
+static NSString *const GXKLangKeyID9 = @"key_pos_9keys_left_4";
+static NSString *const GXKLangKeyID26 = @"key_pos_globe";
+// 未选中那一段的亮度：与选中段同色，只降透明度，跟随原生主题换色。
+#define GXK_LANG_DIM_ALPHA 0.35
 
 // 原包 Gboard 2.3.19 已确认的内容接口；只读模型，不改 actions/布局。
 @protocol GXKNativeSoftKeyContent <NSObject>
@@ -56,6 +62,20 @@ static NSTimer *gStatePollTimer;
 static BOOL gUpdatingActionKey;
 // 按需轮询剩余补帧次数：事件把它抬高，归零后停表，空闲时零唤醒。
 static NSInteger gPollTicks;
+
+// 齿轮键覆盖层：与动作键同一趟遍历里定位，归属、存档、按钮各自独立，互不牵连。
+static __weak UIView *gLangKeyView;
+// 守卫归属：绑定期间指向我们接管的齿轮键；撤键结束即清空，未绑定的键保持原生。
+static __weak UIView *gGuardLangKey;
+static __weak UIView<GXKNativeIconContent> *gLangNativeIcon;
+static UIImage *gLangNormalImage;
+static UIImage *gLangHighlightedImage;
+static id gLangSoftKeyDef;
+static __weak UIView *gLangHost;
+// 纯视觉覆盖按钮：userInteractionEnabled = NO，触摸继续落到底下的原生齿轮键。
+static UIButton *gLangKeyButton;
+// 中文态/字体/前景色都没变就不重建富文本：0.2 秒一拍，不重复分配。
+static BOOL gLangChinese;
 
 // 组字状态缓存：全树扫描只在布局/文本事件里跑，0.2s轮询只读缓存。
 static BOOL gComposingActive;
@@ -520,6 +540,39 @@ static BOOL GXKModelHasNativeActions(id model) {
 // 这里在原生写完的同一轮立刻把前景搬走，帧提交前图层已经是空的：
 // 不改 alpha/hidden/背景，不碰键帽样式，也不碰其它键。
 static BOOL gxk_icon_guard_hooked = NO;
+// 齿轮键判据与守卫在下方「中/英」覆盖层一节定义：本守卫同一趟里也要认这两把键。
+static BOOL GXKLangKeyIDMatches(UIView *key);
+static void gxk_lang_updateView(UIView *key);
+
+// 切页宽限：拼音↔123↔符号快速切换时，detach 已经清空归属，原生却还在重画那把键，
+// 中间这几帧就是用户看到的原生小圆圈。宽限窗口只覆盖「刚刚撤过的那一把键」，
+// 窗口一到立刻交还原生并还原前景，未绑定的键不会长期被清空。
+#define GXK_FLASH_GRACE_SECONDS 0.60
+static __weak UIView *gFlashKey;
+static CFTimeInterval gFlashDeadline;
+
+static BOOL gxk_flash_grace_active(UIView *key) {
+    return key && key == gFlashKey && CFAbsoluteTimeGetCurrent() < gFlashDeadline &&
+           [key.restorationIdentifier isEqualToString:GXKEmojiKeyID];
+}
+
+// 扩展隐藏后没有「正在闪的那一帧」可言：宽限窗口当场作废，下次出现重新按当前布局定位。
+static void GXKClearFlashGrace(void) {
+    gFlashKey = nil;
+    gFlashDeadline = 0;
+}
+
+// 宽限到点必须自愈：轮询随时可能因为空闲停表，若只在 GXKUpdateActionKey 里作废，
+// 键会停在没有前景的状态直到下一次布局。这里在任何原生重画或刷新入口都能兜住。
+static void GXKExpireFlashGraceIfNeeded(void) {
+    if (!gFlashKey || CFAbsoluteTimeGetCurrent() < gFlashDeadline) return;
+    UIView *expired = gFlashKey;
+    gFlashKey = nil; // 先作废再回调，原生这次重画就是「还原」，守卫不会再搬走。
+    gFlashDeadline = 0;
+    if (expired != gEmojiSoftKeyView && [expired respondsToSelector:@selector(updateView)]) {
+        [(id<GXKNativeSoftKeyContent>)expired updateView];
+    }
+}
 // 原方法在二进制里的类型编码是 v16@0:8 —— 返回 void。包装函数必须同样是 void：
 // 按 id 接管会让 ARC 去 retain 一个根本没被赋值的返回寄存器，切键盘当场闪退。
 static void (*gOrigKeyUpdateView)(id, SEL);
@@ -529,10 +582,17 @@ static void gxk_key_updateView(id self, SEL _cmd) {
     // 没有归属中的键就完全交给原生：26键、绑定失败、撤键之后一律不拦。
     if (!gCurrentVC || !gCurrentVC.isViewLoaded) return;
     UIView *key = (UIView *)self;
+    // 原生每次重画都是一次作废窗口的机会：到点立刻还原，键不会停在空白前景。
+    GXKExpireFlashGraceIfNeeded();
+    // 齿轮键走自己的分支：两把键的归属、存档、按钮各自独立，谁都不影响谁。
+    // 必须放在下面表情键的早退之前，否则齿轮键永远轮不到。
+    gxk_lang_updateView(key);
     // 判据不能挂在按钮或图标对象的同一性上：切页这一拍原生会重建 icon，
     // 甚至 GXKDetachActionKey 已把按钮撤走，两种情况下旧判据都放行、笑脸照原样提交一帧。
-    // 改为按「这把键此刻是不是我们归属的九键表情键」判定，图标每次现取。
-    if (key != gGuardKey || ![key.restorationIdentifier isEqualToString:GXKEmojiKeyID]) return;
+    // 改为按「这把键此刻是不是我们归属的九键表情键」判定，图标每次现取；
+    // 刚刚撤过的那把键在很短的宽限窗口里继续清，窗口外一律交还原生。
+    if (key != gGuardKey && !gxk_flash_grace_active(key)) return;
+    if (![key.restorationIdentifier isEqualToString:GXKEmojiKeyID]) return;
     if (!GXKNineKeyBodyForKey(key, gCurrentVC.view)) return;
     if (key.window != gCurrentVC.view.window) return;
     UIView<GXKNativeIconContent> *icon = GXKNativeIconForKey(key);
@@ -542,6 +602,18 @@ static void gxk_key_updateView(id self, SEL _cmd) {
     if (icon.image) gActionNormalImage = icon.image;
     if (icon.highlightedImage) gActionHighlightedImage = icon.highlightedImage;
     // 只清前景两态，背景层与原生键帽保持原样。
+    if (icon.image) icon.image = nil;
+    if (icon.highlightedImage) icon.highlightedImage = nil;
+}
+
+// 齿轮键守卫：原生重画会把 globe 图标写回前景，同一趟里先存档再清。
+// 与笑脸键分开存两套图，两种覆盖层互不覆盖对方的存档。
+static void gxk_lang_updateView(UIView *key) {
+    if (key != gGuardLangKey || !GXKLangKeyIDMatches(key)) return;
+    UIView<GXKNativeIconContent> *icon = GXKNativeIconForKey(key);
+    if (!icon) return;
+    if (icon.image) gLangNormalImage = icon.image;
+    if (icon.highlightedImage) gLangHighlightedImage = icon.highlightedImage;
     if (icon.image) icon.image = nil;
     if (icon.highlightedImage) icon.highlightedImage = nil;
 }
@@ -571,6 +643,213 @@ static UIFont *GXKNativeActionFont(UIView *key, UIView *root) {
     return GXKNativeKeyFont(body, root);
 }
 
+#pragma mark - 齿轮键「中/英」覆盖层
+
+// 齿轮键（切语言键）原生只有图标、没有文字：九键左列第 4 键与 26 键右上角键在布局表里
+// 都映射 softkey_globe。这里只做视觉覆盖——把原生图标搬走，在同一位置画「中」「英」两字，
+// 当前语言那一字满不透明，另一字降透明度。
+// 覆盖按钮 userInteractionEnabled = NO：触摸照旧落到底下的原生键，切换语言仍走原生路径，
+// 我们不改任何输入行为，也不新增手势。
+static BOOL gUpdatingLangKey;
+
+static BOOL GXKLangKeyIDMatches(UIView *key) {
+    NSString *ident = key.restorationIdentifier;
+    if (![ident isKindOfClass:[NSString class]]) return NO;
+    return [ident isEqualToString:GXKLangKeyID9] || [ident isEqualToString:GXKLangKeyID26];
+}
+
+// 九键键必须落在九键体内，26 键键必须不在九键体内：两套布局不会互相冒领。
+static UIView *GXKFindLangKey(UIView *root) {
+    Class keyClass = GXKClassCached(@"GKBSoftKeyView", &gCachedKeyClass);
+    if (!root || !root.window || !keyClass) return nil;
+    UIView *candidate = nil;
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
+    NSUInteger visited = 0;
+    while (stack.count && visited++ < 1500) {
+        UIView *v = stack.lastObject;
+        [stack removeLastObject];
+        if (v.isHidden || v.alpha < 0.05 || v.window != root.window) continue;
+        if ([v isKindOfClass:keyClass] && GXKLangKeyIDMatches(v) && GXKKeyIsVisible(v, root)) {
+            UIView *nineBody = GXKNineKeyBodyForKey(v, root);
+            BOOL ownerOK = [v.restorationIdentifier isEqualToString:GXKLangKeyID9] ? (nineBody != nil) : (nineBody == nil);
+            if (ownerOK) {
+                if (candidate && candidate != v) return nil; // 同时可见两把：不猜。
+                candidate = v;
+            }
+        }
+        [stack addObjectsFromArray:v.subviews];
+    }
+    if (stack.count) return nil; // 遍历不完整，绝不当作有效定位。
+    return candidate;
+}
+
+// 语言判据：宿主给的输入语言优先；取不到就沿用上一次判定，避免无谓闪动。
+static BOOL GXKLangCurrentIsChinese(UIViewController *vc) {
+    if (![vc isKindOfClass:[UIInputViewController class]]) return gLangChinese;
+    NSString *lang = ((UIInputViewController *)vc).textDocumentProxy.primaryLanguage;
+    if (![lang isKindOfClass:[NSString class]] || lang.length < 2) return gLangChinese;
+    return [lang.lowercaseString hasPrefix:@"zh"];
+}
+
+static NSAttributedString *GXKLangAttributedTitle(BOOL chinese, UIColor *color, UIFont *font) {
+    UIColor *dim = [color colorWithAlphaComponent:GXK_LANG_DIM_ALPHA];
+    NSMutableAttributedString *text = [[NSMutableAttributedString alloc] initWithString:@"中英"];
+    [text addAttribute:NSForegroundColorAttributeName value:(chinese ? color : dim) range:NSMakeRange(0, 1)];
+    [text addAttribute:NSForegroundColorAttributeName value:(chinese ? dim : color) range:NSMakeRange(1, 1)];
+    if (font) [text addAttribute:NSFontAttributeName value:font range:NSMakeRange(0, 2)];
+    return text;
+}
+
+static void GXKDetachLangKey(void) {
+    BOOL wasUpdating = gUpdatingLangKey;
+    gUpdatingLangKey = YES;
+    UIView *oldKey = gLangKeyView;
+    UIView<GXKNativeIconContent> *oldIcon = gLangNativeIcon;
+    UIImage *normalImage = gLangNormalImage;
+    UIImage *highlightedImage = gLangHighlightedImage;
+    id oldModel = gLangSoftKeyDef;
+    UIButton *oldButton = gLangKeyButton;
+    gLangKeyView = nil;
+    gLangNativeIcon = nil;
+    gLangNormalImage = nil;
+    gLangHighlightedImage = nil;
+    gLangSoftKeyDef = nil;
+    gLangHost = nil;
+    gLangKeyButton = nil;
+    [oldButton removeFromSuperview];
+    // 归属先释放再调原生 updateView：这次重画是「还原」，守卫不能再把图搬走。
+    gGuardLangKey = nil;
+    if (oldKey && [oldKey respondsToSelector:@selector(updateView)]) {
+        BOOL wasHidden = oldKey.isHidden;
+        [(id<GXKNativeSoftKeyContent>)oldKey updateView];
+        oldKey.hidden = wasHidden;
+        if (GXKLangKeyIDMatches(oldKey) && GXKNativeIconForKey(oldKey) == oldIcon &&
+            ((id<GXKNativeSoftKeyContent>)oldKey).softKeyDef == oldModel) {
+            if (!oldIcon.image && normalImage) oldIcon.image = normalImage;
+            if (!oldIcon.highlightedImage && highlightedImage) oldIcon.highlightedImage = highlightedImage;
+        }
+    }
+    gUpdatingLangKey = wasUpdating;
+}
+
+static void GXKUpdateLangKey(UIViewController *vc) {
+    if (gUpdatingLangKey || !vc || vc != gCurrentVC || !vc.isViewLoaded) return;
+    gUpdatingLangKey = YES;
+    UIView *root = vc.view;
+    BOOL chinese = GXKLangCurrentIsChinese(vc);
+    gLangChinese = chinese;
+
+    // 廉价路径：绑定仍有效时只搬图、对位、改两字透明度，不做全树定位。
+    if (gLangKeyView && gLangNativeIcon && gLangSoftKeyDef && gLangKeyButton && gLangHost &&
+        gLangKeyButton.superview == gLangHost && GXKLangKeyIDMatches(gLangKeyView) &&
+        GXKActionHostForKey(gLangKeyView) == gLangHost && [gLangKeyView isDescendantOfView:root] &&
+        GXKKeyIsVisible(gLangKeyView, root) && GXKNativeIconForKey(gLangKeyView) == gLangNativeIcon &&
+        ((id<GXKNativeSoftKeyContent>)gLangKeyView).softKeyDef == gLangSoftKeyDef) {
+        UIButton *cheapBtn = gLangKeyButton;
+        UIView<GXKNativeIconContent> *cheapIcon = gLangNativeIcon;
+        if (cheapIcon.image) {
+            gLangNormalImage = cheapIcon.image;
+            cheapIcon.image = nil;
+        }
+        if (cheapIcon.highlightedImage) {
+            gLangHighlightedImage = cheapIcon.highlightedImage;
+            cheapIcon.highlightedImage = nil;
+        }
+        CGRect cheapRect = [gLangKeyView convertRect:gLangKeyView.bounds toView:gLangHost];
+        if (!CGRectEqualToRect(cheapBtn.frame, cheapRect)) cheapBtn.frame = cheapRect;
+        if (gLangHost.subviews.lastObject != cheapBtn) [gLangHost bringSubviewToFront:cheapBtn];
+        UIColor *cheapColor = cheapIcon.foregroundColor;
+        if (![cheapColor isKindOfClass:[UIColor class]]) cheapColor = cheapBtn.currentTitleColor;
+        UIFont *cheapFont = GXKNativeKeyFont(GXKNineKeyBodyForKey(gLangKeyView, root) ?: gLangKeyView, root);
+        NSAttributedString *cheapTitle = GXKLangAttributedTitle(chinese, cheapColor, cheapFont);
+        if (![[cheapBtn attributedTitleForState:UIControlStateNormal] isEqualToAttributedString:cheapTitle]) {
+            [cheapBtn setAttributedTitle:cheapTitle forState:UIControlStateNormal];
+            cheapBtn.accessibilityLabel = chinese ? @"中/英，当前中文" : @"中/英，当前英文";
+        }
+        gUpdatingLangKey = NO;
+        return;
+    }
+
+    UIView *currentKey = GXKFindLangKey(root);
+    UIView<GXKNativeIconContent> *icon = GXKNativeIconForKey(currentKey);
+    id model = icon ? ((id<GXKNativeSoftKeyContent>)currentKey).softKeyDef : nil;
+    if (!currentKey || !icon || ![icon.foregroundColor isKindOfClass:[UIColor class]]) {
+        GXKDetachLangKey(); // 只装一种语言、26 键无齿轮键等情形一律保持原生。
+        gUpdatingLangKey = NO;
+        return;
+    }
+    UIView *host = GXKActionHostForKey(currentKey);
+    if (!host) {
+        GXKDetachLangKey();
+        gUpdatingLangKey = NO;
+        return;
+    }
+    if (gLangKeyView != currentKey || gLangNativeIcon != icon || gLangSoftKeyDef != model ||
+        !gLangKeyButton || gLangKeyButton.superview != host) {
+        GXKDetachLangKey();
+        if (vc != gCurrentVC || !vc.isViewLoaded || vc.view != root) {
+            gUpdatingLangKey = NO;
+            return;
+        }
+        currentKey = GXKFindLangKey(root);
+        icon = GXKNativeIconForKey(currentKey);
+        model = icon ? ((id<GXKNativeSoftKeyContent>)currentKey).softKeyDef : nil;
+        BOOL hasForeground = [icon.image isKindOfClass:[UIImage class]] ||
+                             [icon.highlightedImage isKindOfClass:[UIImage class]];
+        if (!currentKey || !icon || !hasForeground || ![icon.foregroundColor isKindOfClass:[UIColor class]]) {
+            gUpdatingLangKey = NO;
+            return;
+        }
+        host = GXKActionHostForKey(currentKey);
+        if (!host) {
+            gUpdatingLangKey = NO;
+            return;
+        }
+        UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
+        btn.backgroundColor = [UIColor clearColor];
+        btn.adjustsImageWhenHighlighted = NO;
+        btn.showsTouchWhenHighlighted = NO;
+        btn.titleLabel.adjustsFontSizeToFitWidth = YES;
+        btn.titleLabel.minimumScaleFactor = 0.6;
+        btn.titleLabel.numberOfLines = 1;
+        btn.autoresizingMask = UIViewAutoresizingNone;
+        // 纯视觉覆盖：命中测试直接跳过本按钮，触摸落回原生齿轮键。
+        btn.userInteractionEnabled = NO;
+        btn.accessibilityElementsHidden = YES;
+        gLangKeyView = currentKey;
+        gGuardLangKey = currentKey;
+        gLangNativeIcon = icon;
+        gLangSoftKeyDef = model;
+        gLangHost = host;
+        gLangKeyButton = btn;
+        [host addSubview:btn];
+        btn.frame = [currentKey convertRect:currentKey.bounds toView:host];
+    }
+
+    if (icon.image) {
+        gLangNormalImage = icon.image;
+        icon.image = nil;
+    }
+    if (icon.highlightedImage) {
+        gLangHighlightedImage = icon.highlightedImage;
+        icon.highlightedImage = nil;
+    }
+    UIButton *btn = gLangKeyButton;
+    gLangHost = host;
+    if (btn.superview != host) [host addSubview:btn];
+    CGRect targetRect = [currentKey convertRect:currentKey.bounds toView:host];
+    if (!CGRectEqualToRect(btn.frame, targetRect)) btn.frame = targetRect;
+    if (host.subviews.lastObject != btn) [host bringSubviewToFront:btn];
+    UIColor *color = icon.foregroundColor;
+    UIFont *font = GXKNativeKeyFont(GXKNineKeyBodyForKey(currentKey, root) ?: currentKey, root);
+    NSAttributedString *title = GXKLangAttributedTitle(chinese, color, font);
+    if (![[btn attributedTitleForState:UIControlStateNormal] isEqualToAttributedString:title]) {
+        [btn setAttributedTitle:title forState:UIControlStateNormal];
+        btn.accessibilityLabel = chinese ? @"中/英，当前中文" : @"中/英，当前英文";
+    }
+    gUpdatingLangKey = NO;
+}
+
 static void GXKDetachActionKey(void) {
     BOOL wasUpdating = gUpdatingActionKey;
     gUpdatingActionKey = YES; // 原生refresh引起布局回调时不能重新绑定正在释放的按钮。
@@ -588,6 +867,10 @@ static void GXKDetachActionKey(void) {
     gActionHost = nil;
     gActionKeyButton = nil;
     [oldButton removeFromSuperview];
+    // 切页宽限：这把键刚被撤，原生接下来几帧还会重画它。窗口内守卫继续把原生圆圈搬走，
+    // 用户看不到那一帧；窗口一到守卫立即放行并还原前景，不会长期停在没有图标的状态。
+    gFlashKey = oldKey;
+    gFlashDeadline = oldKey ? (CFAbsoluteTimeGetCurrent() + GXK_FLASH_GRACE_SECONDS) : 0;
     // 归属先释放再调原生 updateView：这次重画是「还原」，守卫不能再把图搬走，
     // 否则本地存档为空时键会停在无前景状态。
     gGuardKey = nil;
@@ -1075,6 +1358,7 @@ static void GXKBumpPolling(NSInteger ticks) {
         }
         gPollTicks--;
         GXKUpdateActionKey(vc);
+        GXKUpdateLangKey(vc);
         GXKUpdateToolbar(vc);
     }];
     // scheduledTimerWithTimeInterval: 已经把表挂到默认模式；再挂 CommonModes 会让 0.2 秒轮询
@@ -1133,6 +1417,8 @@ static void GXKUpdateActionKey(UIViewController *vc) {
     if (gUpdatingActionKey || !vc || vc != gCurrentVC || !vc.isViewLoaded) return;
     gUpdatingActionKey = YES;
     UIView *root = vc.view;
+    // 宽限窗口到点就作废：此后守卫只认当前绑定，撤键的那把键恢复原生前景。
+    GXKExpireFlashGraceIfNeeded();
 
     // 廉价路径：绑定仍然有效时只刷新标题/位置，不做全树定位。
     // 任一条不成立就落回完整路径，失败闭合语义不变。
@@ -1298,6 +1584,7 @@ static void gkx_textDidChange(id self, SEL _cmd, id textInput) {
             BOOL wasComposing = gComposingActive;
             GXKRefreshComposingState(vc); // 组字状态只在此处与布局事件里全树扫描一次。
             GXKUpdateActionKey(vc);
+            GXKUpdateLangKey(vc); // 中英切换只改视觉，必须与文本事件同一拍跟上。
             GXKUpdateToolbar(vc);
             // 只有组字状态翻转才需要完整补帧窗口；普通打字补两帧就够，
             // 否则连续输入会让定时器永远跑不完，等于持续每秒 5 次全量刷新。
@@ -1330,6 +1617,7 @@ static void gkx_viewDidLayoutSubviews(id self, SEL _cmd) {
         if (!vc || !vc.isViewLoaded) return;
         GXKRefreshComposingState(vc);
         GXKUpdateActionKey(vc);
+        GXKUpdateLangKey(vc); // 换页会重建键，齿轮键覆盖层在这一拍重新对位。
         GXKUpdateToolbar(vc);
         // 锁定只在这一拍校正：本帧布局已定稿，判定才准；且每帧至多一次，
         // 不在上面那几十次同步回调里做全树扫描。
@@ -1343,6 +1631,7 @@ static void gkx_viewWillAppear(id self, SEL _cmd, BOOL animated) {
     if (gOrigViewWillAppear) gOrigViewWillAppear(self, _cmd, animated);
     if ((UIViewController *)self != gCurrentVC) {
         GXKDetachActionKey();
+        GXKDetachLangKey();
         GXKDetachToolbar();
     }
     if (gCurrentVC != (UIViewController *)self) GXKResetNativeKeyStyle();
@@ -1378,6 +1667,8 @@ static void gkx_viewWillDisappear(id self, SEL _cmd, BOOL animated) {
         gSuggestingActive = NO; // 联想缓存同样作废，避免下次出现误显示「收起」。
         GXKStopPolling();
         GXKDetachActionKey();
+        GXKClearFlashGrace(); // 扩展隐藏后不再需要补帧窗口，别让它跨会话留到下次出现。
+        GXKDetachLangKey(); // 齿轮键覆盖层随键盘一起撤走，原生图标按存档还原。
         GXKDetachToolbar(); // 扩展隐藏后工具条随宿主一起撤走，下次出现重新定位。
         GXKDetachPhrasesPanel(); // 常用语面板随扩展隐藏一起撤走。
         GXKPunctPopupTeardown(); // 标点长按弹层与手势一并撤销，下次出现重新挂。
@@ -1391,6 +1682,7 @@ static void gkx_viewDidAppear(id self, SEL _cmd, BOOL animated) {
     if ((UIViewController *)self == gCurrentVC) {
         GXKRefreshComposingState((UIViewController *)self);
         GXKUpdateActionKey((UIViewController *)self);
+        GXKUpdateLangKey((UIViewController *)self);
         GXKUpdateToolbar((UIViewController *)self);
         GXKBumpPolling(GXK_POLL_BURST);
     }
