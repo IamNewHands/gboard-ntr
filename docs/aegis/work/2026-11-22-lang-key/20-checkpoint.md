@@ -1,11 +1,72 @@
 # 最新续跑状态
 
-## 齿轮键「中/英」覆盖层 + 切页闪图收口（2026-11-22；源码/回归完成，CI 与真机待办）
+## 中英判据根因修复 + 闪烁埋点（2026-11-22；源码/回归完成，CI 与真机待办）
 
-- 改动面：`dylib/gkx.m`（新增覆盖层一节 + 守卫接线 + 宽限窗口）、`tests/test_lang_key.py`（新增 12 项契约）、`README.md`（第 8 条功能）、`docs/aegis/work/2026-11-22-lang-key/`。
-- 键身份：只认 `restorationIdentifier` 的 `key_pos_9keys_left_4`（九键）与 `key_pos_globe`（26 键），再叠加「必须在九键体内 / 必须不在九键体内」；两把键同时可见即放弃，遍历不完整即放弃，绝不按坐标或遍历顺序猜。
-- 覆盖方式：原生前景存档后置 nil，在键宿主上叠 `userInteractionEnabled = NO` 的按钮画「中英」；当前语言那一字满色、另一字 `GXK_LANG_DIM_ALPHA`(0.35)。不新增手势、不拦触摸、不改键盘高度。
-- 守卫顺序（**本轮修正过一次**）：`gxk_key_updateView` 里 `gxk_lang_updateView(key)` 必须排在笑脸键早退 `if (key != gGuardKey ...) return;` 之前，否则齿轮键永远轮不到。
-- 切页宽限：`GXK_FLASH_GRACE_SECONDS` 0.60 秒；`GXKDetachActionKey` 记录刚撤的键，`GXKExpireFlashGraceIfNeeded` 在守卫与更新路径各自兜底（轮询空闲会停表，只在更新路径作废会让键停在空白前景），扩展隐藏时 `GXKClearFlashGrace` 当场作废。
-- 验证：`tests/test_lang_key.py` 12 项 OK、`tests/test_action_key.py` 26 项 OK、`tests/test_perf.py` 42 项 OK，其余 9 个套件同样全绿。
-- 未完成：本机无 iOS clang/SDK，未本地编译；`git push` 因 schannel 无凭据失败（`gh auth status` 显示已登录 IamNewHands，token 具备 repo/workflow 权限，可用 `gh` 走 HTTPS 推送）；真机验收未做。
+### 根因（已由产物实证，不再是猜测）
+
+扩展 `Payload/Gboard.app/PlugIns/GboardExtension.appex/Info.plist` 里：
+
+```
+NSExtensionAttributes.PrimaryLanguage = "mul"
+NSExtensionPointIdentifier = "com.apple.keyboard-service"
+NSExtensionPrincipalClass = "GKBUIInputViewController"
+```
+
+"mul" 是「多语言」占位值。所以宿主回给扩展的语言恒为 `mul`，
+`GXKLangCurrentLanguage(vc)` 拿到 `"mul"`，`hasPrefix:@"zh"` 永远为假
+→ **中文输入法下也永远高亮「英」**。这不是时序问题，靠补帧修不好。
+
+### 修法：改问 Gboard 自己的语言对象
+
+- 新增 `@protocol GXKLangIDProbe`（`+ (id)currentLanguage` / `- (BOOL)isChinese`）
+  与 `static NSInteger GXKLangReflectedState(void)`：`NSClassFromString(@"GKBLanguageID")`
+  + `respondsToSelector` 双重校验，命中返回 1/0，类或方法不在返回 -1。
+  静态量只解析一次，之后每拍只调一次类方法。
+- 为什么是 `GKBLanguageID` 而不是 `GKBLanguageManager`：前者有类方法 `+currentLanguage`，
+  零实例依赖；后者只有实例方法且没有公开共享实例入口，反射成本高得多。
+- 为什么一定加载得到：appex 的 LC_LOAD_DYLIB 里非系统依赖只有
+  `@rpath/gboard_framework.framework/gboard_framework`（rpath = `@executable_path/../../Frameworks`），
+  扩展进程必然已加载该 framework。
+- 兜底语义保留：反射不可用 → 退回原宿主语言判据；再取不到 → 保持 `gLangChinese`（不闪）。
+
+### 闪烁埋点（全部走「设置 → 诊断日志」开关，关态零成本）
+
+| 埋点 | 位置 | 行格式 |
+|---|---|---|
+| 布局每拍 | `gxk_key_updateView`，仅两把接管键 | `upd <id> own=0/1 grace=0/1` |
+| 原生重画表情键 | 同上，`icon.image/highlightedImage` 非空才算 | `gd emoji g=own/grace` |
+| 原生重画齿轮键 | `gxk_lang_updateView` | `gd lang <id>` |
+| 撤键 | `GXKDetachActionKey` | `det emoji <id>` |
+| 宽限作废 | `GXKExpireFlashGraceIfNeeded` | `grce exp <id>` |
+| 语言判据 | `GXKLangCurrentIsChinese`，仅状态变化时 | `lang src=<src> state=1/0/-1` |
+
+- `gd` 两行只在原生**真的**把圆圈画回来时写：正常帧不进 300 行环形缓冲，闪的那几拍才看得见。
+- `lang` 只在状态翻转时写：0.2 秒一拍，不变化就一行不写。
+- 原型 `static void GXKPunctDiagLog(NSString *fmt, ...);` 放在 `dylib/gkx.m:35` 附近：
+  `punct_diag.h` 到 1907 行才 import，而埋点最早在 574 行。
+- 守卫顺序保持不变：`GXKIsOverlayKey(key)` 是单独函数，守卫主体里
+  `gxk_flash_grace_active(key)` 仍排在 `isEqualToString:GXKEmojiKeyID]` 之前
+  （`tests/test_lang_key.py::test_page_switch_grace_window_is_bounded_and_restores_native` 盯着这条）。
+
+### 验证
+
+- `cd gboard-ntr && python -m unittest discover -s tests -p 'test_*.py'` → **Ran 161 tests, OK**。
+- 新增 2 项契约（`tests/test_diag.py`）：
+  `test_language_decision_prefers_gboard_language_object`（反射优先于宿主语言、保留 zh 兜底）、
+  `test_flash_instrumentation_stays_behind_the_switch`（埋点全走 GXKPunctDiagLog、守卫顺序不乱、原型早于使用）。
+
+### 未完成
+
+1. 本机无 iOS clang/SDK，**未本地编译**；只能靠 GitHub Actions（push `dylib/**` 触发）。
+2. 真机验收未做：需要在设置里打开「诊断日志」，切几次中英再长按 HUD 复制日志回传。
+3. 出包未做（CI 产物进 builds 分支后替换 Release IPA 里的 `Frameworks/libgkx.dylib`）。
+
+### 真机验收步骤
+
+1. 装包 → 设置 → 诊断日志（开）。
+2. 键盘上切换中文/英文各两次，观察齿轮键高亮是否跟随。
+3. 切页（九键↔26 键）几次，看是否还闪小圆圈。
+4. 长按 HUD 复制，粘回聊天。
+5. 判读：`lang src=GKBLanguageID state=1` 应随中英翻转；若出现 `state=-1` 说明反射没命中，
+   若出现 `src=mul` 说明退回了宿主判据（即修复未生效）。
+   闪圆圈看 `gd emoji`/`gd lang` 是否出现在 `own=0 grace=0` 的 `upd` 之后 —— 那就是漏网的一帧。

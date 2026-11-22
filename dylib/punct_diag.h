@@ -186,7 +186,8 @@ static NSString *GXKPunctDiagReport(void) {
      (unsigned long)gDiagFire, (unsigned long)gDiagPairOk, (unsigned long)gDiagPairTimeout,
      (unsigned long)gDiagPairOffPage, (unsigned long)gDiagPairGiveUp];
     [out appendString:@"legend: upd=layout beat find=key lookup att=gesture attach det=detach\n"
-                       "lp=long-press state cmt=commit pair=pair completion retry\n"];
+                       "lp=long-press state cmt=commit pair=pair completion retry\n"
+                       "lang=language decision gd=native repaint grabbed grce=grace expired\n"];
     [out appendString:[gDiagRing componentsJoinedByString:@"\n"]];
     return out;
 }

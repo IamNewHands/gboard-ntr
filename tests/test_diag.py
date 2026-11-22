@@ -87,3 +87,35 @@ class DiagSwitchTest(unittest.TestCase):
         inject = function_body(self.source, "static void GXKInjectPhrasesRow(")
         self.assertIn("GXKDiagSettingsRow(", inject)
         self.assertIn("insertObjects:ours", inject)
+
+    def test_language_decision_prefers_gboard_language_object(self) -> None:
+        # 根因：扩展 Info.plist 的 PrimaryLanguage 是 "mul"，宿主语言永远不是 zh/en，
+        # 所以中英判据必须改问 Gboard 自己的 GKBLanguageID，宿主语言只作兜底。
+        probe = function_body(self.source, "static NSInteger GXKLangReflectedState(")
+        self.assertIn('NSClassFromString(@"GKBLanguageID")', probe)
+        self.assertIn("@selector(currentLanguage)", probe)
+        self.assertIn("@selector(isChinese)", probe)
+        decide = function_body(self.source, "static BOOL GXKLangCurrentIsChinese(")
+        self.assertLess(decide.index("GXKLangReflectedState()"),
+                        decide.index("GXKLangCurrentLanguage(vc)"))
+        self.assertIn('hasPrefix:@"zh"', decide)
+
+    def test_flash_instrumentation_stays_behind_the_switch(self) -> None:
+        # 闪烁埋点只在开关打开时写缓冲，且每条都走 GXKPunctDiagLog（关态立即 return）。
+        for signature, token in (
+            ("static void GXKExpireFlashGraceIfNeeded(", '@"grce exp %@"'),
+            ("static void GXKDetachActionKey(", '@"det emoji %@"'),
+        ):
+            body = function_body(self.source, signature)
+            self.assertIn("GXKPunctDiagLog(", body)
+            self.assertIn(token, body)
+        guard = function_body(self.source, "static void gxk_key_updateView(")
+        self.assertIn("GXKIsOverlayKey(key)", guard)
+        self.assertIn('@"upd %@ own=%d grace=%d"', guard)
+        # 守卫主体原有的判据顺序不能被埋点打乱。
+        self.assertLess(guard.index("gxk_flash_grace_active(key)"),
+                        guard.index("isEqualToString:GXKEmojiKeyID]"))
+        # 原型必须早于第一次使用，否则 ARC 下会按隐式声明当成返回 id。
+        self.assertLess(self.source.index("static void GXKPunctDiagLog(NSString *fmt, ...);"),
+                        self.source.index("GXKPunctDiagLog(@"))
+

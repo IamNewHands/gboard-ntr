@@ -29,6 +29,11 @@ static NSString *const GXKLangKeyID26 = @"key_pos_globe";
 // 未选中那一段的亮度：与选中段同色，只降透明度，跟随原生主题换色。
 #define GXK_LANG_DIM_ALPHA 0.35
 
+// [DIAG-punct] 诊断日志的实现在 punct_diag.h（本文件末尾才 import），这里先给原型，
+// 好让中英判据与图标守卫在更早的位置也能埋点。开关关着时 GXKPunctDiagLog 立刻 return，
+// 不分配、不拼串，键盘侧零成本。
+static void GXKPunctDiagLog(NSString *fmt, ...);
+
 // 原包 Gboard 2.3.19 已确认的内容接口；只读模型，不改 actions/布局。
 @protocol GXKNativeSoftKeyContent <NSObject>
 @property(nonatomic, readonly) NSDictionary *idToViewDict;
@@ -569,10 +574,18 @@ static void GXKExpireFlashGraceIfNeeded(void) {
     UIView *expired = gFlashKey;
     gFlashKey = nil; // 先作废再回调，原生这次重画就是「还原」，守卫不会再搬走。
     gFlashDeadline = 0;
+    GXKPunctDiagLog(@"grce exp %@", expired.restorationIdentifier);
     if (expired != gEmojiSoftKeyView && [expired respondsToSelector:@selector(updateView)]) {
         [(id<GXKNativeSoftKeyContent>)expired updateView];
     }
 }
+// 诊断用：这把键是不是我们接管的那两把（九键表情键、齿轮键）。
+// 单独成函数，是为了让守卫主体里的判据顺序保持原样（先认归属/宽限，再认键 ID）。
+static BOOL GXKIsOverlayKey(UIView *key) {
+    if (!key) return NO;
+    return [key.restorationIdentifier isEqualToString:GXKEmojiKeyID] || GXKLangKeyIDMatches(key);
+}
+
 // 原方法在二进制里的类型编码是 v16@0:8 —— 返回 void。包装函数必须同样是 void：
 // 按 id 接管会让 ARC 去 retain 一个根本没被赋值的返回寄存器，切键盘当场闪退。
 static void (*gOrigKeyUpdateView)(id, SEL);
@@ -587,6 +600,13 @@ static void gxk_key_updateView(id self, SEL _cmd) {
     // 齿轮键走自己的分支：两把键的归属、存档、按钮各自独立，谁都不影响谁。
     // 必须放在下面表情键的早退之前，否则齿轮键永远轮不到。
     gxk_lang_updateView(key);
+    // [DIAG-punct] 闪圆圈只在「原生重画了这两把键」的那几拍发生，所以只给它们记入口：
+    // own=当前归属 grace=刚撤的宽限窗口。两者都 false 还重画，就说明守卫放行了这一帧。
+    if (GXKIsOverlayKey(key)) {
+        GXKPunctDiagLog(@"upd %@ own=%d grace=%d", key.restorationIdentifier,
+                        key == gGuardKey || key == gGuardLangKey,
+                        gxk_flash_grace_active(key));
+    }
     // 判据不能挂在按钮或图标对象的同一性上：切页这一拍原生会重建 icon，
     // 甚至 GXKDetachActionKey 已把按钮撤走，两种情况下旧判据都放行、笑脸照原样提交一帧。
     // 改为按「这把键此刻是不是我们归属的九键表情键」判定，图标每次现取；
@@ -598,6 +618,10 @@ static void gxk_key_updateView(id self, SEL _cmd) {
     UIView<GXKNativeIconContent> *icon = GXKNativeIconForKey(key);
     if (!icon) return;
     if (!GXKModelHasNativeActions(((id<GXKNativeSoftKeyContent>)key).softKeyDef)) return;
+    // 只有「原生真的把圆圈画回来了」才记一行：正常帧不进环形缓冲，日志才看得清闪烁那几拍。
+    if (icon.image || icon.highlightedImage) {
+        GXKPunctDiagLog(@"gd emoji g=%@", key == gGuardKey ? @"own" : @"grace");
+    }
     // 原生这一轮重画的图先存档再清：撤键时仍能按原样还原。
     if (icon.image) gActionNormalImage = icon.image;
     if (icon.highlightedImage) gActionHighlightedImage = icon.highlightedImage;
@@ -612,6 +636,9 @@ static void gxk_lang_updateView(UIView *key) {
     if (key != gGuardLangKey || !GXKLangKeyIDMatches(key)) return;
     UIView<GXKNativeIconContent> *icon = GXKNativeIconForKey(key);
     if (!icon) return;
+    if (icon.image || icon.highlightedImage) {
+        GXKPunctDiagLog(@"gd lang %@", key.restorationIdentifier);
+    }
     if (icon.image) gLangNormalImage = icon.image;
     if (icon.highlightedImage) gLangHighlightedImage = icon.highlightedImage;
     if (icon.image) icon.image = nil;
@@ -702,11 +729,59 @@ static NSString *GXKLangCurrentLanguage(UIViewController *vc) {
     return nil;
 }
 
+// Gboard 自己认的当前语言。扩展的 Info.plist 里 NSExtensionAttributes.PrimaryLanguage = "mul"
+// （多语言扩展），所以宿主给回来的 textDocumentProxy / textInputMode.primaryLanguage 恒为 "mul"，
+// 既不是 zh 也不是 en —— hasPrefix:@"zh" 永远为假，这就是「中文下也一直高亮英」的根因。
+// GKBLanguageID 在 gboard_framework 里（appex 经 @rpath 链接，扩展进程里必然已加载），
+// appex 自身没有这个类，只能 NSClassFromString + 协议探测反射调用。
+// 三态：1 中文、0 英文、-1 未知（类或方法不在时退回宿主语言判据）。
+@protocol GXKLangIDProbe <NSObject>
++ (id)currentLanguage;
+- (BOOL)isChinese;
+@end
+
+static NSInteger GXKLangReflectedState(void) {
+    static Class langIDClass;
+    static BOOL probed;
+    if (!probed) {
+        probed = YES;
+        Class cls = NSClassFromString(@"GKBLanguageID");
+        if (cls && [cls respondsToSelector:@selector(currentLanguage)] &&
+            [cls instancesRespondToSelector:@selector(isChinese)]) {
+            langIDClass = cls;
+        }
+    }
+    if (!langIDClass) return -1;
+    id lang = [(id<GXKLangIDProbe>)langIDClass currentLanguage];
+    if (!lang || ![lang respondsToSelector:@selector(isChinese)]) return -1;
+    return [(id<GXKLangIDProbe>)lang isChinese] ? 1 : 0;
+}
+
+// 判据只在变化时记一行：0.2 秒一拍，不变化就不进环形缓冲，别把其它信号挤掉。
+static NSInteger gLangLoggedState = -2;
+
+static void GXKLangLogDecision(NSInteger state, NSString *source) {
+    if (state == gLangLoggedState) return;
+    gLangLoggedState = state;
+    GXKPunctDiagLog(@"lang src=%@ state=%ld", source, (long)state);
+}
+
 static BOOL GXKLangCurrentIsChinese(UIViewController *vc) {
     if (![vc isKindOfClass:[UIInputViewController class]]) return gLangChinese;
+    // 先问 Gboard 自己的语言对象：多语言扩展里宿主语言恒为 "mul"，不能当判据用。
+    NSInteger reflected = GXKLangReflectedState();
+    if (reflected >= 0) {
+        GXKLangLogDecision(reflected, @"GKBLanguageID");
+        return reflected == 1;
+    }
     NSString *lang = GXKLangCurrentLanguage(vc);
-    if (![lang isKindOfClass:[NSString class]] || lang.length < 2) return gLangChinese;
-    return [lang.lowercaseString hasPrefix:@"zh"];
+    if (![lang isKindOfClass:[NSString class]] || lang.length < 2) {
+        GXKLangLogDecision(-1, @"none");
+        return gLangChinese;
+    }
+    BOOL chinese = [lang.lowercaseString hasPrefix:@"zh"];
+    GXKLangLogDecision(chinese ? 1 : 0, lang);
+    return chinese;
 }
 
 static NSAttributedString *GXKLangAttributedTitle(BOOL chinese, UIColor *color, UIFont *font) {
@@ -889,6 +964,7 @@ static void GXKDetachActionKey(void) {
     // 用户看不到那一帧；窗口一到守卫立即放行并还原前景，不会长期停在没有图标的状态。
     gFlashKey = oldKey;
     gFlashDeadline = oldKey ? (CFAbsoluteTimeGetCurrent() + GXK_FLASH_GRACE_SECONDS) : 0;
+    GXKPunctDiagLog(@"det emoji %@", oldKey.restorationIdentifier);
     // 归属先释放再调原生 updateView：这次重画是「还原」，守卫不能再把图搬走，
     // 否则本地存档为空时键会停在无前景状态。
     gGuardKey = nil;
