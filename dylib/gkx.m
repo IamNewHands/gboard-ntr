@@ -625,6 +625,162 @@ static void GXKClearIconImages(UIView<GXKNativeIconContent> *icon) {
 // 按 id 接管会让 ARC 去 retain 一个根本没被赋值的返回寄存器，切键盘当场闪退。
 static void (*gOrigKeyUpdateView)(id, SEL);
 
+#pragma mark - 前景写入拦截（闪圆圈的正解）
+
+// 事后再清为什么不够：原生 updateView 内部可能自己提交一次 CA 事务，
+// 图在那一拍就已经交给渲染服务，我们再把它置空只影响下一帧——中间这一帧就是闪圈。
+// 所以改在写入点拦：守卫归属中、或刚撤键的宽限窗口里，这把键的前景图根本不进图层。
+// 只拦非空写入；置空一律放行，否则我们自己也没法把图撤下来。
+static BOOL gxk_icon_block_hooked = NO;
+// 我们自己要把图写回去（撤键还原）时必须放行，否则还原写入被自己的拦截挡掉，
+// 键会空白到宽限结束——那是比闪一帧更严重的回归。
+static BOOL gxk_icon_write_bypass = NO;
+static void (*gOrigIconSetImage)(id, SEL, UIImage *);
+static void (*gOrigIconSetHighlightedImage)(id, SEL, UIImage *);
+static void (*gOrigIconSetBackgroundImage)(id, SEL, UIImage *);
+static void (*gOrigIconSetHighlightedBackgroundImage)(id, SEL, UIImage *);
+
+// 这个前景视图是不是「当前守卫的键」或「刚撤下、还在宽限里的键」的前景。
+// 往上找 GKBSoftKeyView：嵌套键的祖先也算，判据只会更宽，不会误拦普通键。
+static UIView *GXKGuardedKeyForIcon(UIView *icon) {
+    if (gxk_icon_write_bypass) return nil;
+    // 廉价早退：没有归属、也没有宽限窗口时，键盘上每一次图标写入都直接放行，
+    // 不往上走父链、不做九键布局体判定。绝大多数帧都走这条路。
+    if (!gGuardKey && !gGuardLangKey && !gFlashKey) return nil;
+    Class keyClass = GXKClassCached(@"GKBSoftKeyView", &gCachedKeyClass);
+    if (!keyClass || !icon) return nil;
+    for (UIView *v = icon.superview; v; v = v.superview) {
+        if (![v isKindOfClass:keyClass]) continue;
+        if (v == gGuardKey || v == gGuardLangKey) return v;
+        if (gxk_flash_grace_active(v)) return v;
+    }
+    return nil;
+}
+
+static void gxk_icon_setImage(id self, SEL _cmd, UIImage *image) {
+    UIView *key = image ? GXKGuardedKeyForIcon((UIView *)self) : nil;
+    if (key) {
+        // 拦下来的图不能丢：撤键那一刻要靠它把原生笑脸写回去，
+        // 否则守卫期间归档永远为空，键会空白到宽限结束。
+        if (key == gGuardKey) gActionNormalImage = image;
+        GXKPunctDiagLog(@"blk img %@", key.restorationIdentifier);
+        return;
+    }
+    if (gOrigIconSetImage) gOrigIconSetImage(self, _cmd, image);
+}
+
+static void gxk_icon_setHighlightedImage(id self, SEL _cmd, UIImage *image) {
+    UIView *key = image ? GXKGuardedKeyForIcon((UIView *)self) : nil;
+    if (key) {
+        if (key == gGuardKey) gActionHighlightedImage = image;
+        GXKPunctDiagLog(@"blk himg %@", key.restorationIdentifier);
+        return;
+    }
+    if (gOrigIconSetHighlightedImage) gOrigIconSetHighlightedImage(self, _cmd, image);
+}
+
+// 背景层不拦，只记一笔：万一下一版还闪，日志能立刻分清是前景还是背景在画圆圈。
+static void gxk_icon_setBackgroundImage(id self, SEL _cmd, UIImage *image) {
+    UIView *key = image ? GXKGuardedKeyForIcon((UIView *)self) : nil;
+    if (key) GXKPunctDiagLog(@"bg bg %@", key.restorationIdentifier);
+    if (gOrigIconSetBackgroundImage) gOrigIconSetBackgroundImage(self, _cmd, image);
+}
+
+static void gxk_icon_setHighlightedBackgroundImage(id self, SEL _cmd, UIImage *image) {
+    UIView *key = image ? GXKGuardedKeyForIcon((UIView *)self) : nil;
+    if (key) GXKPunctDiagLog(@"bg hbg %@", key.restorationIdentifier);
+    if (gOrigIconSetHighlightedBackgroundImage) gOrigIconSetHighlightedBackgroundImage(self, _cmd, image);
+}
+
+// 视图的 setImage: 只是转发层，原生也可能直接写 GKBImageLayer。两条路都堵住：
+// 图层的 delegate 通常就是那个前景视图，沿 superlayer 再兜一层，找不到归属一律放行。
+static void (*gOrigLayerSetImage)(id, SEL, UIImage *);
+static void (*gOrigLayerSetHighlightedImage)(id, SEL, UIImage *);
+
+static UIView *GXKIconOwnerForLayer(CALayer *layer) {
+    id owner = layer.delegate;
+    if (![owner isKindOfClass:[UIView class]]) owner = layer.superlayer.delegate;
+    return [owner isKindOfClass:[UIView class]] ? (UIView *)owner : nil;
+}
+
+static void gxk_layer_setImage(id self, SEL _cmd, UIImage *image) {
+    UIView *owner = image ? GXKIconOwnerForLayer((CALayer *)self) : nil;
+    UIView *key = owner ? GXKGuardedKeyForIcon(owner) : nil;
+    if (key) {
+        if (key == gGuardKey) gActionNormalImage = image; // 撤键还原靠这张，拦了也留着。
+        GXKPunctDiagLog(@"blk layer img %@", key.restorationIdentifier);
+        return;
+    }
+    if (gOrigLayerSetImage) gOrigLayerSetImage(self, _cmd, image);
+}
+
+static void gxk_layer_setHighlightedImage(id self, SEL _cmd, UIImage *image) {
+    UIView *owner = image ? GXKIconOwnerForLayer((CALayer *)self) : nil;
+    UIView *key = owner ? GXKGuardedKeyForIcon(owner) : nil;
+    if (key) {
+        if (key == gGuardKey) gActionHighlightedImage = image;
+        GXKPunctDiagLog(@"blk layer himg %@", key.restorationIdentifier);
+        return;
+    }
+    if (gOrigLayerSetHighlightedImage) gOrigLayerSetHighlightedImage(self, _cmd, image);
+}
+
+// 只换「这个类自己实现」的方法：class_getInstanceMethod 会往上找到父类，
+// 对继承来的 setImage: 调 method_setImplementation 等于改写 UIImageView 全家，
+// 那是整机级别的破坏。父类实现一律不碰，交给图层那一路兜底。
+static BOOL GXKClassImplementsSelector(Class cls, SEL sel) {
+    unsigned int count = 0;
+    Method *list = class_copyMethodList(cls, &count);
+    BOOL found = NO;
+    for (unsigned int i = 0; i < count; i++) {
+        if (method_getName(list[i]) == sel) { found = YES; break; }
+    }
+    if (list) free(list);
+    return found;
+}
+
+// 这些 setter 都声明在 GKBImageViewWithBackground 自己身上，直接换实现即可。
+// 类晚加载时返回 NO，由 viewWillAppear 再补一次。
+static BOOL GXKInstallIconWriteBlock(void) {
+    if (gxk_icon_block_hooked) return YES;
+    // 两个类都可能晚加载：谁在就先挂谁，全都挂上才算完成，否则下次出现再来。
+    BOOL hooked = NO;
+    Class cls = NSClassFromString(@"GKBImageViewWithBackground");
+    struct { SEL sel; IMP imp; void **orig; } setters[] = {
+        {@selector(setImage:), (IMP)gxk_icon_setImage, (void **)&gOrigIconSetImage},
+        {@selector(setHighlightedImage:), (IMP)gxk_icon_setHighlightedImage, (void **)&gOrigIconSetHighlightedImage},
+        {@selector(setBackgroundImage:), (IMP)gxk_icon_setBackgroundImage, (void **)&gOrigIconSetBackgroundImage},
+        {@selector(setHighlightedBackgroundImage:), (IMP)gxk_icon_setHighlightedBackgroundImage,
+         (void **)&gOrigIconSetHighlightedBackgroundImage},
+    };
+    for (size_t i = 0; cls && i < sizeof(setters) / sizeof(setters[0]); i++) {
+        if (!GXKClassImplementsSelector(cls, setters[i].sel)) continue;
+        Method m = class_getInstanceMethod(cls, setters[i].sel);
+        if (!m) continue;
+        *setters[i].orig = (void *)method_getImplementation(m);
+        method_setImplementation(m, setters[i].imp);
+        hooked = YES;
+    }
+    // 图层那一路：类名不在就跳过，视图那一路仍然生效。
+    Class layerCls = NSClassFromString(@"GKBImageLayer");
+    if (layerCls && GXKClassImplementsSelector(layerCls, @selector(setImage:))) {
+        Method lm = class_getInstanceMethod(layerCls, @selector(setImage:));
+        if (lm) {
+            gOrigLayerSetImage = (void *)method_getImplementation(lm);
+            method_setImplementation(lm, (IMP)gxk_layer_setImage);
+            hooked = YES;
+        }
+        Method lh = class_getInstanceMethod(layerCls, @selector(setHighlightedImage:));
+        if (lh && GXKClassImplementsSelector(layerCls, @selector(setHighlightedImage:))) {
+            gOrigLayerSetHighlightedImage = (void *)method_getImplementation(lh);
+            method_setImplementation(lh, (IMP)gxk_layer_setHighlightedImage);
+            hooked = YES;
+        }
+    }
+    gxk_icon_block_hooked = hooked; // 什么都没挂上就保持 NO，下次出现重试。
+    return hooked;
+}
+
 static void gxk_key_updateView(id self, SEL _cmd) {
     if (gOrigKeyUpdateView) gOrigKeyUpdateView(self, _cmd);
     // 没有归属中的键就完全交给原生：26键、绑定失败、撤键之后一律不拦。
@@ -697,6 +853,7 @@ static void GXKInstallIconWriteGuard(void) {
         method_setImplementation(m, (IMP)gxk_key_updateView);
     }
     gxk_icon_guard_hooked = YES;
+    GXKInstallIconWriteBlock(); // 同一个类晚加载时一起补挂。
 }
 
 #import "native_key_style.h"
@@ -854,8 +1011,10 @@ static void GXKDetachLangKey(void) {
         oldKey.hidden = wasHidden;
         if (GXKLangKeyIDMatches(oldKey) && GXKNativeIconForKey(oldKey) == oldIcon &&
             ((id<GXKNativeSoftKeyContent>)oldKey).softKeyDef == oldModel) {
+            gxk_icon_write_bypass = YES;
             if (!oldIcon.image && normalImage) oldIcon.image = normalImage;
             if (!oldIcon.highlightedImage && highlightedImage) oldIcon.highlightedImage = highlightedImage;
+            gxk_icon_write_bypass = NO;
         }
     }
     gUpdatingLangKey = wasUpdating;
@@ -923,9 +1082,8 @@ static void GXKUpdateLangKey(UIViewController *vc) {
         currentKey = GXKFindLangKey(root);
         icon = GXKNativeIconForKey(currentKey);
         model = icon ? ((id<GXKNativeSoftKeyContent>)currentKey).softKeyDef : nil;
-        BOOL hasForeground = [icon.image isKindOfClass:[UIImage class]] ||
-                             [icon.highlightedImage isKindOfClass:[UIImage class]];
-        if (!currentKey || !icon || !hasForeground || ![icon.foregroundColor isKindOfClass:[UIColor class]]) {
+        // 同上：守卫会在写入点拦截，前景为空是正常状态，不能因此拒绝绑定。
+        if (!currentKey || !icon || ![icon.foregroundColor isKindOfClass:[UIColor class]]) {
             gUpdatingLangKey = NO;
             return;
         }
@@ -1018,8 +1176,10 @@ static void GXKDetachActionKey(void) {
         if ([oldKey.restorationIdentifier isEqualToString:GXKEmojiKeyID] &&
             GXKNativeIconForKey(oldKey) == oldIcon &&
             ((id<GXKNativeSoftKeyContent>)oldKey).softKeyDef == oldModel) {
+            gxk_icon_write_bypass = YES;
             if (!oldIcon.image && normalImage) oldIcon.image = normalImage;
             if (!oldIcon.highlightedImage && highlightedImage) oldIcon.highlightedImage = highlightedImage;
+            gxk_icon_write_bypass = NO;
         }
     }
     gUpdatingActionKey = wasUpdating;
@@ -1625,10 +1785,9 @@ static void GXKUpdateActionKey(UIViewController *vc) {
         icon = GXKNativeIconForKey(currentKey);
         model = icon ? ((id<GXKNativeSoftKeyContent>)currentKey).softKeyDef : nil;
         color = icon.foregroundColor;
-        // 新绑定必须存在当前原生前景与action，不用上次保存的图授权空内容模型。
-        BOOL hasForeground = [icon.image isKindOfClass:[UIImage class]] ||
-                             [icon.highlightedImage isKindOfClass:[UIImage class]];
-        if (!currentKey || !icon || !GXKModelHasNativeActions(model) || !hasForeground ||
+        // 前景图不能当绑定前提：写入拦截上线后，被守卫的键前景永远是空的，
+        // 要求「必须有原生前景」会让这把键再也绑不上，切页后一直停在无图标状态。
+        if (!currentKey || !icon || !GXKModelHasNativeActions(model) ||
             ![color isKindOfClass:[UIColor class]]) {
             gUpdatingActionKey = NO;
             return;

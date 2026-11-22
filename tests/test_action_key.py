@@ -208,14 +208,72 @@ class ActionKeySourceContracts(unittest.TestCase):
         self.assertIn("!GXKModelHasNativeActions(gActionSoftKeyDef)", tap)
         self.assertGreaterEqual(update.count("!GXKModelHasNativeActions(model)"), 2)
 
-    def test_fresh_binding_requires_current_foreground_not_previous_images(self):
+    def test_fresh_binding_uses_live_key_not_previous_images(self):
+        """绑定判据只看当前键/模型/前景色，绝不用上一次存下来的图授权。
+
+        前景图本身不能当前提：写入拦截上线后被守卫的键前景恒为空，
+        再要求「必须有原生前景」会让切页后的新键永远绑不上。
+        """
         update = function_body(self.source, "static void GXKUpdateActionKey(UIViewController *vc) {")
         fresh = update[update.index("gEmojiSoftKeyView != currentKey"):update.index("[UIButton buttonWithType:UIButtonTypeCustom]")]
-        self.assertIn("[icon.image isKindOfClass:[UIImage class]]", fresh)
-        self.assertIn("[icon.highlightedImage isKindOfClass:[UIImage class]]", fresh)
-        self.assertIn("!hasForeground", fresh)
+        self.assertIn("GXKFindNineKeyEmojiKey(root)", fresh)
+        self.assertIn("GXKNativeIconForKey(currentKey)", fresh)
+        self.assertIn("!GXKModelHasNativeActions(model)", fresh)
+        self.assertNotIn("hasForeground", fresh)
+        self.assertNotIn("icon.image", fresh)
+        self.assertNotIn("icon.highlightedImage", fresh)
         self.assertNotIn("gActionNormalImage", fresh)
         self.assertNotIn("gActionHighlightedImage", fresh)
+
+    def test_foreground_writes_are_blocked_at_the_setter_not_after_the_fact(self):
+        """事后清图救不了闪圈：原生那一拍已经把图交给渲染服务。
+
+        真正的修法是在写入点拦：守卫归属中或刚撤键的宽限窗口里，非空前景不进图层；
+        置空必须放行，否则我们自己也没法把图撤下来。
+        """
+        helper = function_body(self.source, "static UIView *GXKGuardedKeyForIcon(UIView *icon) {")
+        self.assertIn('GXKClassCached(@"GKBSoftKeyView", &gCachedKeyClass)', helper)
+        self.assertIn("v == gGuardKey", helper)
+        self.assertIn("v == gGuardLangKey", helper)
+        self.assertIn("gxk_flash_grace_active(v)", helper)
+
+        image = function_body(self.source, "static void gxk_icon_setImage(id self, SEL _cmd, UIImage *image) {")
+        # 只有非空写入才拦；置空放行给原生，撤图仍走原生路径。
+        self.assertIn("UIView *key = image ? GXKGuardedKeyForIcon((UIView *)self) : nil;", image)
+        self.assertIn("if (key) {", image)
+        self.assertIn("return;", image)
+        self.assertIn("gOrigIconSetImage(self, _cmd, image)", image)
+        # 拦下来的图必须存档：撤键那一刻要靠它把原生笑脸写回去。
+        self.assertIn("gActionNormalImage = image;", image)
+
+        highlighted = function_body(
+            self.source, "static void gxk_icon_setHighlightedImage(id self, SEL _cmd, UIImage *image) {")
+        self.assertIn("UIView *key = image ? GXKGuardedKeyForIcon((UIView *)self) : nil;", highlighted)
+        self.assertIn("gOrigIconSetHighlightedImage(self, _cmd, image)", highlighted)
+        self.assertIn("gActionHighlightedImage = image;", highlighted)
+
+        # 我们自己还原时走旁路，否则写回去的图会被自己的拦截吃掉，键空白到宽限结束。
+        self.assertIn("static BOOL gxk_icon_write_bypass = NO;", self.source)
+        self.assertIn("if (gxk_icon_write_bypass) return nil;", helper)
+
+        install = function_body(self.source, "static BOOL GXKInstallIconWriteBlock(void) {")
+        self.assertIn('NSClassFromString(@"GKBImageViewWithBackground")', install)
+        for setter in ("setImage:", "setHighlightedImage:",
+                       "setBackgroundImage:", "setHighlightedBackgroundImage:"):
+            self.assertIn("@selector(%s)" % setter, install)
+        self.assertIn("method_setImplementation(m, setters[i].imp);", install)
+        # 两个类都可能晚加载：只要挂上了任意一个就记账，全都没挂就保持 NO 下次再来。
+        self.assertIn("gxk_icon_block_hooked = hooked;", install)
+        self.assertIn("return hooked;", install)
+        # 只换类自己的实现：对继承来的方法调 method_setImplementation 会改写父类，
+        # 等于给整机所有 UIImageView 装上拦截。
+        self.assertIn("GXKClassImplementsSelector(cls, setters[i].sel)", install)
+        # 图层那一路也要堵：原生可以直接写 GKBImageLayer，绕过视图 setter。
+        self.assertIn('NSClassFromString(@"GKBImageLayer")', install)
+        self.assertIn("gxk_layer_setImage", install)
+        # 类晚加载时随 updateView 守卫一起补挂。
+        guard_install = function_body(self.source, "static void GXKInstallIconWriteGuard(void) {")
+        self.assertIn("GXKInstallIconWriteBlock();", guard_install)
 
     def test_action_and_toolbar_fonts_share_identified_native_key_owner(self):
         self.assertIn('#import "native_key_style.h"', self.source)
