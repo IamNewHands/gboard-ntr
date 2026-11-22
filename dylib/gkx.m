@@ -609,6 +609,18 @@ static BOOL GXKIsOverlayKey(UIView *key) {
     return [key.restorationIdentifier isEqualToString:GXKEmojiKeyID] || GXKLangKeyIDMatches(key);
 }
 
+// 清图标必须瞬时生效：GKBImageLayer 自己实现了 actionForKey:，普通赋值会让 Core Animation
+// 给 contents 生成一段隐式淡出——前景图不是立刻消失，而是花零点几秒淡走，
+// 那几帧正是用户看到的「闪一下圆圈」。把这一趟放进关闭动作的事务里，赋值当场落地。
+static void GXKClearIconImages(UIView<GXKNativeIconContent> *icon) {
+    if (!icon) return;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    if (icon.image) icon.image = nil;
+    if (icon.highlightedImage) icon.highlightedImage = nil;
+    [CATransaction commit];
+}
+
 // 原方法在二进制里的类型编码是 v16@0:8 —— 返回 void。包装函数必须同样是 void：
 // 按 id 接管会让 ARC 去 retain 一个根本没被赋值的返回寄存器，切键盘当场闪退。
 static void (*gOrigKeyUpdateView)(id, SEL);
@@ -648,9 +660,8 @@ static void gxk_key_updateView(id self, SEL _cmd) {
     // 原生这一轮重画的图先存档再清：撤键时仍能按原样还原。
     if (icon.image) gActionNormalImage = icon.image;
     if (icon.highlightedImage) gActionHighlightedImage = icon.highlightedImage;
-    // 只清前景两态，背景层与原生键帽保持原样。
-    if (icon.image) icon.image = nil;
-    if (icon.highlightedImage) icon.highlightedImage = nil;
+    // 只清前景两态，背景层与原生键帽保持原样；必须瞬时，不能淡出。
+    GXKClearIconImages(icon);
     // 走的是宽限而不是归属：这把键是切页后重建的新实例，还没有人接管它。
     // 立刻补绑一次，别等 0.2 秒轮询——否则用户先看到的是原生圆圈闪一下再变成文字。
     if (!gEmojiSoftKeyView) GXKScheduleActionKeyRebind();
@@ -667,8 +678,7 @@ static void gxk_lang_updateView(UIView *key) {
     }
     if (icon.image) gLangNormalImage = icon.image;
     if (icon.highlightedImage) gLangHighlightedImage = icon.highlightedImage;
-    if (icon.image) icon.image = nil;
-    if (icon.highlightedImage) icon.highlightedImage = nil;
+    GXKClearIconImages(icon);
 }
 
 // 类可能晚于构造阶段加载：viewWillAppear 里补挂一次，挂上即置位，不重复接管。
@@ -2949,6 +2959,55 @@ static void GXKRelabelDiagViews(UIView *view, NSString *title, NSUInteger depth)
     for (UIView *child in view.subviews) GXKRelabelDiagViews(child, title, depth + 1);
 }
 
+// 整份 descriptor 里所有自家诊断行一起改标题：上屏的 descriptor 可能只是副本，
+// 只改被点的那一行，翻页回来又是旧字。
+static void GXKRetitleDiagRows(id pageController, NSString *title) {
+    if (![pageController respondsToSelector:@selector(pageDescriptor)]) return;
+    id descriptor = ((id (*)(id, SEL))objc_msgSend)(pageController, @selector(pageDescriptor));
+    NSArray *sections = GXKSectionsOf(descriptor);
+    for (id section in sections) {
+        NSArray *rows = GXKRowsOf(section);
+        for (id row in rows) {
+            if (![GXKKeyOf(row) isEqualToString:GXKDiagRowKey]) continue;
+            if ([row respondsToSelector:@selector(setTitle:)]) {
+                ((void (*)(id, SEL, id))objc_msgSend)(row, @selector(setTitle:), title);
+            }
+        }
+    }
+}
+
+// 主 App 里的轻量提示：一个半透明胶囊，1.2 秒后淡出。
+// 设置行本身没有开关控件，标题文字变了也容易被当成「没反应」，加这一下才算点完有回音。
+static void GXKShowToastInView(UIView *host, NSString *text) {
+    if (!host || text.length == 0) return;
+    UILabel *toast = [[UILabel alloc] init];
+    toast.text = text;
+    toast.font = [UIFont systemFontOfSize:14.0 weight:UIFontWeightMedium];
+    toast.textColor = [UIColor whiteColor];
+    toast.textAlignment = NSTextAlignmentCenter;
+    toast.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.82];
+    toast.layer.cornerRadius = 16.0;
+    toast.layer.masksToBounds = YES;
+    toast.userInteractionEnabled = NO;
+    toast.alpha = 0.0;
+    CGSize fit = [toast sizeThatFits:CGSizeMake(host.bounds.size.width - 40.0, 44.0)];
+    CGFloat w = MIN(fit.width + 32.0, host.bounds.size.width - 40.0);
+    toast.frame = CGRectMake((host.bounds.size.width - w) / 2.0,
+                             host.bounds.size.height - 120.0, w, 32.0);
+    toast.autoresizingMask = UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleLeftMargin |
+                             UIViewAutoresizingFlexibleRightMargin;
+    [host addSubview:toast];
+    [UIView animateWithDuration:0.15 animations:^{
+        toast.alpha = 1.0;
+    } completion:^(BOOL finished) {
+        [UIView animateWithDuration:0.35 delay:0.9 options:0 animations:^{
+            toast.alpha = 0.0;
+        } completion:^(BOOL done) {
+            [toast removeFromSuperview];
+        }];
+    }];
+}
+
 static void GXKToggleDiagLog(id self, id collectionView, id indexPath) {
     NSUserDefaults *defaults = [[NSUserDefaults alloc] initWithSuiteName:GXKGroup];
     if (!defaults) defaults = [NSUserDefaults standardUserDefaults];
@@ -2956,26 +3015,27 @@ static void GXKToggleDiagLog(id self, id collectionView, id indexPath) {
     [defaults setBool:enabled forKey:GXKDiagLogKey];
     [defaults synchronize]; // 跨进程，键盘那边要立刻看见。
     NSString *title = GXKDiagRowTitle();
-    // 行对象在内存里就地改标题；不支持 setTitle: 就只靠下面的 cell 改写兜底。
-    id row = GXKDescriptorRowAt(self, indexPath);
-    if ([row respondsToSelector:@selector(setTitle:)]) {
-        ((void (*)(id, SEL, id))objc_msgSend)(row, @selector(setTitle:), title);
-    }
-    if ([collectionView respondsToSelector:@selector(cellForItemAtIndexPath:)]) {
-        id cell = ((id (*)(id, SEL, id))objc_msgSend)(
-            collectionView, @selector(cellForItemAtIndexPath:), indexPath);
-        if ([cell isKindOfClass:[UIView class]]) GXKRelabelDiagViews((UIView *)cell, title, 0);
-    }
+    // 行对象就地改标题。注意：上屏的 descriptor 可能是 mainMenuPageDescriptor 的副本，
+    // 只改当前这一行不够——整份 descriptor 里所有自家诊断行都要改成同一个标题。
+    GXKRetitleDiagRows(self, title);
     // 取消选中动画会让这一行停在灰色高亮上，看起来像「还没生效」。
     if ([collectionView respondsToSelector:@selector(deselectItemAtIndexPath:animated:)]) {
         ((void (*)(id, SEL, id, BOOL))objc_msgSend)(
             collectionView, @selector(deselectItemAtIndexPath:animated:), indexPath, NO);
     }
-    // 只重载这一格：整页重建会把所有 cell 重新生成，点一下卡一下正是它造成的。
-    if ([collectionView respondsToSelector:@selector(reloadItemsAtIndexPaths:)]) {
-        ((void (*)(id, SEL, id))objc_msgSend)(
-            collectionView, @selector(reloadItemsAtIndexPaths:), @[indexPath]);
+    // 不重载：任何 reload 都会用（可能陈旧的）descriptor 重新配置 cell，把我们刚写的标题盖回去。
+    // 直接改屏幕上这格的所有 UILabel，用户松手那一帧就看到新状态。
+    if ([collectionView respondsToSelector:@selector(cellForItemAtIndexPath:)]) {
+        id cell = ((id (*)(id, SEL, id))objc_msgSend)(
+            collectionView, @selector(cellForItemAtIndexPath:), indexPath);
+        if ([cell isKindOfClass:[UIView class]]) GXKRelabelDiagViews((UIView *)cell, title, 0);
     }
+    if ([collectionView isKindOfClass:[UIView class]]) {
+        GXKRelabelDiagViews((UIView *)collectionView, title, 0); // 兜底：整页扫一遍
+    }
+    // 文本已经改了，但用户需要一个「这次点击确实生效了」的即时反馈。
+    GXKShowToastInView([self isKindOfClass:[UIViewController class]] ? ((UIViewController *)self).view : nil,
+                       [NSString stringWithFormat:@"诊断日志已%@", enabled ? @"开启" : @"关闭"]);
     GXK_LOG(@"[*] 诊断日志已%@", enabled ? @"开启" : @"关闭");
 }
 

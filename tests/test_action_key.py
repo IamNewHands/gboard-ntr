@@ -90,7 +90,10 @@ class ActionKeySourceContracts(unittest.TestCase):
         self.assertIn("gSuggestingActive = NO", gone)
 
     def test_native_keycap_is_not_hidden_or_repainted(self):
-        action = self.source[self.source.index("#pragma mark - 动作键目标与更新"):]
+        # 只扫动作键那一段：设置页的 toast 有自己的圆角，不属于键帽外观。
+        start = self.source.index("#pragma mark - 动作键目标与更新")
+        end = self.source.index("#pragma mark - 主 App：常用语维护入口")
+        action = self.source[start:end]
         for retired in ("GXKRestoreKeySubviews", "sub.hidden = YES", "sub.hidden = NO", "cornerRadius", "colorWithWhite:0.35", "colorWithRed:0.82", "userInterfaceStyle"):
             self.assertNotIn(retired, action)
         update = function_body(self.source, "static void GXKUpdateActionKey(UIViewController *vc) {")
@@ -241,11 +244,18 @@ class ActionKeySourceContracts(unittest.TestCase):
         self.assertNotIn("icon != gActionNativeIcon", guard)
         self.assertNotIn("!gActionKeyButton", guard)
         # 图标必须每次现取：守卫里缓存的那一个在切页后已经不是图层上的那一个。
-        self.assertLess(guard.index("GXKNativeIconForKey(key)"), guard.index("icon.image = nil"))
+        self.assertLess(guard.index("GXKNativeIconForKey(key)"), guard.index("GXKClearIconImages(icon)"))
         # 原生重画的图要先存档再清，撤键时才还原得回来。
-        self.assertLess(guard.index("gActionNormalImage = icon.image"), guard.index("icon.image = nil"))
+        self.assertLess(guard.index("gActionNormalImage = icon.image"), guard.index("GXKClearIconImages(icon)"))
         self.assertLess(guard.index("gActionHighlightedImage = icon.highlightedImage"),
-                        guard.index("icon.highlightedImage = nil"))
+                        guard.index("GXKClearIconImages(icon)"))
+        # 清图必须瞬时：GKBImageLayer 实现了 actionForKey:，普通赋值会走隐式动画，
+        # 前景图淡出那几帧就是用户看到的「闪一下圆圈」。
+        clear = function_body(self.source, "static void GXKClearIconImages(UIView<GXKNativeIconContent> *icon) {")
+        self.assertIn("[CATransaction begin]", clear)
+        self.assertIn("[CATransaction setDisableActions:YES]", clear)
+        self.assertIn("[CATransaction commit]", clear)
+        self.assertLess(clear.index("setDisableActions:YES"), clear.index("icon.image = nil"))
         # 不碰键帽外观：不隐藏、不透明、不改背景层。
         for retired in ("hidden", "alpha", "backgroundLayer", "backgroundColor", "cornerRadius"):
             self.assertNotIn(retired, guard)

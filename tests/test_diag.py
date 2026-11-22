@@ -69,14 +69,24 @@ class DiagSwitchTest(unittest.TestCase):
         self.assertLess(attach.index("GXKPunctDiagEnabled()"), attach.index("UILabel alloc"))
 
     def test_toggle_updates_the_row_without_reloading_the_page(self) -> None:
-        """点一下就要看到新状态：只重载那一格，不许 reloadData 把整页重建。"""
+        """点一下就要看到新状态：不重载任何格子，直接改 descriptor 与屏幕上的文字。
+
+        上一版用 reloadItemsAtIndexPaths: 刷这一格，真机上点完仍是旧字——reload 会拿
+        一份可能陈旧的 descriptor 重新配置 cell，把刚写进去的标题盖回去。
+        """
         toggle = function_body(self.source, "static void GXKToggleDiagLog(")
-        self.assertIn("reloadItemsAtIndexPaths:", toggle)
         self.assertNotIn("reloadData", toggle)
+        self.assertNotIn("reloadItemsAtIndexPaths:", toggle)
         # 行对象和屏幕上的 cell 未必是同一个，两条路都要写标题。
+        self.assertIn("GXKRetitleDiagRows(", toggle)
         self.assertIn("GXKRelabelDiagViews(", toggle)
         self.assertIn("cellForItemAtIndexPath:", toggle)
-        self.assertLess(toggle.index("setBool:enabled forKey:"), toggle.index("reloadItemsAtIndexPaths:"))
+        # 点完要有即时反馈：设置行没有开关控件，只有标题变化容易被当成没反应。
+        self.assertIn("GXKShowToastInView(", toggle)
+        self.assertLess(toggle.index("setBool:enabled forKey:"), toggle.index("GXKRetitleDiagRows("))
+        retitle = function_body(self.source, "static void GXKRetitleDiagRows(")
+        self.assertIn("GXKDiagRowKey", retitle)
+        self.assertIn("setTitle:", retitle)
         relabel = function_body(self.source, "static void GXKRelabelDiagViews(")
         self.assertIn('hasPrefix:@"诊断日志"', relabel)
 
