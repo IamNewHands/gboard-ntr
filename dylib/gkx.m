@@ -736,7 +736,9 @@ static void GXKExpireFlashGraceIfNeeded(void) {
     BOOL expiredVisible = gCurrentVC && gCurrentVC.isViewLoaded &&
                           [expired isDescendantOfView:gCurrentVC.view] &&
                           GXKKeyIsVisible(expired, gCurrentVC.view);
-    BOOL holdOff = gxk_rebind_hold(expired) || (expiredVisible && gxk_rebind_pending());
+    // 已不是当前绑定的旧壳更要拦：它仍在屏幕上，还原就是把笑脸画到用户眼前（日志 9 的 4 次）。
+    BOOL holdOff = gxk_rebind_hold(expired) ||
+                   (expiredVisible && (gxk_rebind_pending() || expired != gEmojiSoftKeyView));
     if (expired != gEmojiSoftKeyView && !holdOff &&
         [expired respondsToSelector:@selector(updateView)]) {
         [(id<GXKNativeSoftKeyContent>)expired updateView];
@@ -783,6 +785,15 @@ static void (*gOrigIconSetHighlightedImage)(id, SEL, UIImage *);
 static void (*gOrigIconSetBackgroundImage)(id, SEL, UIImage *);
 static void (*gOrigIconSetHighlightedBackgroundImage)(id, SEL, UIImage *);
 
+// 归属唯一性：只要还有一把绑定的表情键，别的同 ID 可见实例就是切页留下的旧壳。
+// 日志 9 的圆圈就出在这里——旧壳仍挂在树上、宽限一过没人管，原生一重画就画在它上面。
+static BOOL gxk_stale_emoji_key(UIView *key) {
+    if (!key || !gEmojiSoftKeyView || key == gEmojiSoftKeyView) return NO;
+    if (![key.restorationIdentifier isEqualToString:GXKEmojiKeyID]) return NO;
+    if (!gCurrentVC || !gCurrentVC.isViewLoaded) return NO;
+    return [key isDescendantOfView:gCurrentVC.view] && GXKKeyIsVisible(key, gCurrentVC.view);
+}
+
 // 这个前景视图是不是「当前守卫的键」或「刚撤下、还在宽限里的键」的前景。
 // 往上找 GKBSoftKeyView：嵌套键的祖先也算，判据只会更宽，不会误拦普通键。
 static UIView *GXKGuardedKeyForIcon(UIView *icon) {
@@ -797,6 +808,7 @@ static UIView *GXKGuardedKeyForIcon(UIView *icon) {
         if (v == gGuardKey || v == gGuardLangKey) return v;
         if (gxk_flash_grace_active(v)) return v;
         if (gxk_rebind_hold(v)) return v;
+        if (gxk_stale_emoji_key(v)) return v; // 旧壳不许画原生表情。
     }
     return nil;
 }
@@ -952,7 +964,10 @@ static void gxk_key_updateView(id self, SEL _cmd) {
     // 甚至 GXKDetachActionKey 已把按钮撤走，两种情况下旧判据都放行、笑脸照原样提交一帧。
     // 改为按「这把键此刻是不是我们归属的九键表情键」判定，图标每次现取；
     // 刚刚撤过的那把键在很短的宽限窗口里继续清，窗口外一律交还原生。
-    if (key != gGuardKey && !gxk_flash_grace_active(key) && !gxk_rebind_hold(key)) return;
+    // 旧壳（切页留下、已不是绑定的那个实例）也必须守：否则宽限一过它就归原生管，
+    // 原生重画的那一帧笑脸正好落在还可见的旧壳上，用户看到的就是圆圈。
+    BOOL staleShell = gxk_stale_emoji_key(key);
+    if (key != gGuardKey && !gxk_flash_grace_active(key) && !gxk_rebind_hold(key) && !staleShell) return;
     if (![key.restorationIdentifier isEqualToString:GXKEmojiKeyID]) return;
     // 刚被 GXKDetachActionKey 撤掉的那把键要放宽布局判据。撤键末尾会调一次原生
     // updateView 还原，而切页那一拍九键布局体已经换掉、窗口也可能在变：若这里仍要求
@@ -960,7 +975,7 @@ static void gxk_key_updateView(id self, SEL _cmd) {
     // 而覆盖按钮此刻已被摘走——视频里每次切页露一帧笑脸（帧 128 换行→129 圆圈→130 换行）
     // 就是这个提前返回。只对这一把键放宽，别的键判据不变。
     BOOL justDetached = (key == gFlashKey) && gxk_flash_grace_active(key);
-    if (!justDetached) {
+    if (!justDetached && !staleShell) {
         if (!GXKNineKeyBodyForKey(key, gCurrentVC.view)) return;
         if (key.window != gCurrentVC.view.window) return;
     }
