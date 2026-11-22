@@ -44,6 +44,37 @@ class PerfContracts(unittest.TestCase):
         self.assertIn("GXKBumpPolling(GXK_POLL_BURST)", appear)
         self.assertNotIn("scheduledTimerWithTimeInterval", appear)
 
+    def test_key_lookup_reuses_the_verified_instance(self):
+        """定位缓存：同一个布局里键实例是稳定的，不能每拍都从 root 扫 1500 个节点。"""
+        finder = function_body(self.source, "static UIView *GXKFindNineKeyEmojiKey(UIView *root) {")
+        # 命中缓存必须排在全树扫描之前。
+        self.assertLess(finder.index("GXKCachedEmojiKeyValid(root)"), finder.index("NSMutableArray"))
+        valid = function_body(self.source, "static BOOL GXKCachedEmojiKeyValid(UIView *root) {")
+        # 命中判据与全树扫描一致：同一 root、ID 相符、可见、owner 是可见九键体。
+        for required in ("gCachedEmojiRoot != root", "GXKEmojiKeyID",
+                         "isDescendantOfView:root", "GXKKeyIsVisible(key, root)",
+                         "GXKNineKeyBodyForKey(key, root)"):
+            self.assertIn(required, valid)
+        # 「两把同时可见就不猜」不能因缓存被绕过：命中前必须在九键体子树里复核唯一性。
+        self.assertIn("return found == key && !stack.count", valid)
+        self.assertLess(valid.index("NSMutableArray"), valid.index("return found == key"))
+        # 只缓存完整扫描确认过的实例：半途放弃（stack 未空）不写缓存。
+        self.assertLess(finder.index("if (stack.count ||"), finder.index("gCachedEmojiKey = candidate"))
+        # 缓存必须是 weak：键被重建时自动失效，不拿旧实例冒充当前布局。
+        self.assertIn("static __weak UIView *gCachedEmojiKey;", self.source)
+        self.assertIn("static __weak UIView *gCachedLangKey;", self.source)
+        # 世代：布局/撤键一变缓存立刻失效，结构性歧义一定落回全树扫描。
+        self.assertIn("gCachedEmojiEpoch != gKeyCacheEpoch", valid)
+        lang_valid = function_body(self.source, "static BOOL GXKCachedLangKeyValid(UIView *root) {")
+        self.assertIn("gCachedLangEpoch != gKeyCacheEpoch", lang_valid)
+        layout = function_body(self.source, "static void gkx_viewDidLayoutSubviews(id self, SEL _cmd) {")
+        self.assertIn("GXKBumpKeyCacheEpoch()", layout)
+        # 撤键即作废，下次从头认当前布局。
+        detach = function_body(self.source, "static void GXKDetachActionKey(void) {")
+        self.assertIn("GXKClearEmojiKeyCache()", detach)
+        detach_lang = function_body(self.source, "static void GXKDetachLangKey(void) {")
+        self.assertIn("GXKClearLangKeyCache()", detach_lang)
+
     def test_polling_stops_when_idle(self):
         """空闲必须停表：计数归零后 invalidate，隐藏时也停表。"""
         pump = function_body(self.source, "static void GXKBumpPolling(NSInteger ticks) {")

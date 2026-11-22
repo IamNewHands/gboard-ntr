@@ -481,7 +481,62 @@ static BOOL GXKKeyIsVisible(UIView *key, UIView *root) {
     return NO;
 }
 
+// 定位缓存：键实例在同一个布局里是稳定的，只有切页/切布局才换。
+// 之前每一拍都从 root 起做 1500 节点全树扫描——0.2 秒轮询、每次布局回调、
+// 每次原生重画都要扫一遍。这里先验证上一次认出来的实例，仍然有效就直接返回。
+// 缓存只存 weak，键被重建时自动变 nil，不会拿旧实例冒充当前布局。
+static __weak UIView *gCachedEmojiKey;
+static __weak UIView *gCachedEmojiRoot;
+// 布局世代：任何一次布局/切页/撤键都递增，缓存只在同一世代内有效。
+// 这样「两把键同时可见」这类结构性歧义一定发生在世代变化之后，
+// 命中不了缓存，必然落回全树扫描并按原语义返回 nil——不猜的契约不受影响。
+static NSUInteger gKeyCacheEpoch;
+
+static void GXKBumpKeyCacheEpoch(void) {
+    gKeyCacheEpoch++;
+}
+
+// 缓存命中判据必须和全树扫描一致：可见九键布局体里的表情键，且 owner 仍是同一个可见九键体。
+// 任何一条不成立就落回全树扫描，语义不变、失败闭合不变。
+static NSUInteger gCachedEmojiEpoch;
+
+static BOOL GXKCachedEmojiKeyValid(UIView *root) {
+    UIView *key = gCachedEmojiKey;
+    if (!key || gCachedEmojiRoot != root || gCachedEmojiEpoch != gKeyCacheEpoch) return NO;
+    if (![key.restorationIdentifier isEqualToString:GXKEmojiKeyID]) return NO;
+    if (![key isDescendantOfView:root] || !GXKKeyIsVisible(key, root)) return NO;
+    UIView *body = GXKNineKeyBodyForKey(key, root);
+    if (!body || !GXKKeyIsVisible(body, root)) return NO;
+    // 「同时可见两把表情键就不猜」是定位契约，缓存不能把它绕过去。
+    // 但这条歧义只可能出现在九键体内部：只扫这棵子树（约 30 个节点），
+    // 不必回到 root 做 1500 节点的全树扫描。
+    Class keyClass = GXKClassCached(@"GKBSoftKeyView", &gCachedKeyClass);
+    if (!keyClass) return NO;
+    UIView *found = nil;
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:body];
+    NSUInteger visited = 0;
+    while (stack.count && visited++ < 400) {
+        UIView *v = stack.lastObject;
+        [stack removeLastObject];
+        if (v.isHidden || v.alpha < 0.05) continue;
+        if ([v isKindOfClass:keyClass] && [v.restorationIdentifier isEqualToString:GXKEmojiKeyID] &&
+            GXKKeyIsVisible(v, root)) {
+            if (found && found != v) return NO; // 子树里出现第二把：交给全树扫描按原语义返回 nil。
+            found = v;
+        }
+        [stack addObjectsFromArray:v.subviews];
+    }
+    return found == key && !stack.count; // 遍历完整且只有这一把。
+}
+
+static void GXKClearEmojiKeyCache(void) {
+    gCachedEmojiKey = nil;
+    gCachedEmojiRoot = nil;
+    GXKBumpKeyCacheEpoch();
+}
+
 static UIView *GXKFindNineKeyEmojiKey(UIView *root) {
+    if (GXKCachedEmojiKeyValid(root)) return gCachedEmojiKey;
     Class keyClass = GXKClassCached(@"GKBSoftKeyView", &gCachedKeyClass);
     Class nineClass = GXKClassCached(@"GKB9KeysSoftKeyboardView", &gCachedNineKeyClass);
     Class qwertyClass = GXKClassCached(@"GKBZhQwertySoftKeyboardView", &gCachedQwertyClass);
@@ -512,6 +567,9 @@ static UIView *GXKFindNineKeyEmojiKey(UIView *root) {
     }
     if (stack.count || ![visibleBody isKindOfClass:nineClass] ||
         GXKNineKeyBodyForKey(candidate, root) != visibleBody) return nil;
+    gCachedEmojiKey = candidate; // 只缓存完整扫描确认过的实例，半途放弃不写。
+    gCachedEmojiRoot = candidate ? root : nil;
+    gCachedEmojiEpoch = gKeyCacheEpoch;
     return candidate; // 完整遍历且仅一个可见九键owner；9↔26/独立数字切换不猜。
 }
 
@@ -556,11 +614,36 @@ static void gxk_lang_updateView(UIView *key);
 static __weak UIView *gFlashKey;
 static CFTimeInterval gFlashDeadline;
 
+// 补绑等待窗：宽限到点时键可能还没有归属（原生把键重建成新实例，绑定要等下一拍布局）。
+// 这期间若放行，原生就把笑脸原样画上去——日志 4 里 9391 到 10560 那 1.17 秒的圆圈，
+// 就是「宽限到点先还原生、补绑再下一轮才到」的空档。
+// 等待窗内继续拦前景写入并拒绝把键还给原生；超过上限一律交还原生，
+// 宁可让键空白一小会儿，也绝不让它长期停在「被拦着但没人画字」的状态。
+#define GXK_REBIND_WAIT_SECONDS 2.0
+static CFTimeInterval gRebindWaitDeadline;
+static void GXKNoteRebindPending(void) {
+    gRebindWaitDeadline = CFAbsoluteTimeGetCurrent() + GXK_REBIND_WAIT_SECONDS;
+}
+static BOOL gxk_rebind_pending(void) {
+    return gRebindWaitDeadline > 0 && CFAbsoluteTimeGetCurrent() < gRebindWaitDeadline;
+}
+static void GXKClearRebindPending(void) {
+    gRebindWaitDeadline = 0;
+}
+// 等待窗只对「我们还要接管的键」生效：可见九键布局体里的表情键。
+// 别的键一律不受影响，窗口过期后自动失效，不会变成第二条归属。
+static BOOL gxk_rebind_hold(UIView *key) {
+    if (!key || !gxk_rebind_pending()) return NO;
+    if (![key.restorationIdentifier isEqualToString:GXKEmojiKeyID]) return NO;
+    return gCurrentVC && gCurrentVC.isViewLoaded && GXKNineKeyBodyForKey(key, gCurrentVC.view) != nil;
+}
+
 // 宽限里被重建的新键没有归属，光靠 0.2 秒轮询要等两三拍才绑上，那几拍一直走守卫清图，
 // 手感上就是「切页后动作键反应慢半拍」。这里在守卫内部预约一次下一轮主队列的补绑：
 // 一帧只排一次，不在原生 updateView 的调用栈里做全树定位。
 static BOOL gRebindScheduled = NO;
 static void GXKScheduleActionKeyRebind(void) {
+    GXKNoteRebindPending(); // 补绑在排队期间键还没有归属，守卫必须继续拦。
     if (gRebindScheduled) return;
     gRebindScheduled = YES;
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -585,6 +668,7 @@ static BOOL gxk_flash_grace_active(UIView *key) {
 static void GXKClearFlashGrace(void) {
     gFlashKey = nil;
     gFlashDeadline = 0;
+    GXKClearRebindPending();
 }
 
 // 宽限到点必须自愈：轮询随时可能因为空闲停表，若只在 GXKUpdateActionKey 里作废，
@@ -595,7 +679,12 @@ static void GXKExpireFlashGraceIfNeeded(void) {
     gFlashKey = nil; // 先作废再回调，原生这次重画就是「还原」，守卫不会再搬走。
     gFlashDeadline = 0;
     GXKPunctDiagLog(@"grce exp %@", expired.restorationIdentifier);
-    if (expired != gEmojiSoftKeyView && [expired respondsToSelector:@selector(updateView)]) {
+    // 到点时若这把键仍是可见的九键表情键、而我们还没有绑定它，就不能还给原生：
+    // 这次 updateView 会把笑脸原样画回去，而补绑要等下一轮主队列才到——中间那段
+    // 就是日志 4 里持续 1.17 秒的圆圈。此时改为继续拦（gxk_rebind_hold），
+    // 键空白一两帧后由补绑接上；等待窗到期仍未绑上才真正交还原生。
+    if (expired != gEmojiSoftKeyView && !gxk_rebind_hold(expired) &&
+        [expired respondsToSelector:@selector(updateView)]) {
         [(id<GXKNativeSoftKeyContent>)expired updateView];
     }
     // 窗口到点时若仍没有归属，说明原生把键重建成了新实例、轮询又刚好停表：
@@ -646,13 +735,14 @@ static UIView *GXKGuardedKeyForIcon(UIView *icon) {
     if (gxk_icon_write_bypass) return nil;
     // 廉价早退：没有归属、也没有宽限窗口时，键盘上每一次图标写入都直接放行，
     // 不往上走父链、不做九键布局体判定。绝大多数帧都走这条路。
-    if (!gGuardKey && !gGuardLangKey && !gFlashKey) return nil;
+    if (!gGuardKey && !gGuardLangKey && !gFlashKey && !gxk_rebind_pending()) return nil;
     Class keyClass = GXKClassCached(@"GKBSoftKeyView", &gCachedKeyClass);
     if (!keyClass || !icon) return nil;
     for (UIView *v = icon.superview; v; v = v.superview) {
         if (![v isKindOfClass:keyClass]) continue;
         if (v == gGuardKey || v == gGuardLangKey) return v;
         if (gxk_flash_grace_active(v)) return v;
+        if (gxk_rebind_hold(v)) return v;
     }
     return nil;
 }
@@ -802,7 +892,7 @@ static void gxk_key_updateView(id self, SEL _cmd) {
     // 甚至 GXKDetachActionKey 已把按钮撤走，两种情况下旧判据都放行、笑脸照原样提交一帧。
     // 改为按「这把键此刻是不是我们归属的九键表情键」判定，图标每次现取；
     // 刚刚撤过的那把键在很短的宽限窗口里继续清，窗口外一律交还原生。
-    if (key != gGuardKey && !gxk_flash_grace_active(key)) return;
+    if (key != gGuardKey && !gxk_flash_grace_active(key) && !gxk_rebind_hold(key)) return;
     if (![key.restorationIdentifier isEqualToString:GXKEmojiKeyID]) return;
     if (!GXKNineKeyBodyForKey(key, gCurrentVC.view)) return;
     if (key.window != gCurrentVC.view.window) return;
@@ -878,8 +968,29 @@ static BOOL GXKLangKeyIDMatches(UIView *key) {
     return [ident isEqualToString:GXKLangKeyID9] || [ident isEqualToString:GXKLangKeyID26];
 }
 
+// 齿轮键同款定位缓存：判据与全树扫描一致（可见、ID 相符、九键/26 键归属相符）。
+static __weak UIView *gCachedLangKey;
+static __weak UIView *gCachedLangRoot;
+static NSUInteger gCachedLangEpoch;
+
+static BOOL GXKCachedLangKeyValid(UIView *root) {
+    UIView *key = gCachedLangKey;
+    if (!key || gCachedLangRoot != root || gCachedLangEpoch != gKeyCacheEpoch) return NO;
+    if (!GXKLangKeyIDMatches(key)) return NO;
+    if (![key isDescendantOfView:root] || !GXKKeyIsVisible(key, root)) return NO;
+    UIView *nineBody = GXKNineKeyBodyForKey(key, root);
+    return [key.restorationIdentifier isEqualToString:GXKLangKeyID9] ? (nineBody != nil) : (nineBody == nil);
+}
+
+static void GXKClearLangKeyCache(void) {
+    gCachedLangKey = nil;
+    gCachedLangRoot = nil;
+    GXKBumpKeyCacheEpoch();
+}
+
 // 九键键必须落在九键体内，26 键键必须不在九键体内：两套布局不会互相冒领。
 static UIView *GXKFindLangKey(UIView *root) {
+    if (GXKCachedLangKeyValid(root)) return gCachedLangKey;
     Class keyClass = GXKClassCached(@"GKBSoftKeyView", &gCachedKeyClass);
     if (!root || !root.window || !keyClass) return nil;
     UIView *candidate = nil;
@@ -900,6 +1011,9 @@ static UIView *GXKFindLangKey(UIView *root) {
         [stack addObjectsFromArray:v.subviews];
     }
     if (stack.count) return nil; // 遍历不完整，绝不当作有效定位。
+    gCachedLangKey = candidate; // 只缓存完整扫描确认过的实例，半途放弃不写。
+    gCachedLangRoot = candidate ? root : nil;
+    gCachedLangEpoch = gKeyCacheEpoch;
     return candidate;
 }
 
@@ -987,6 +1101,7 @@ static NSAttributedString *GXKLangAttributedTitle(BOOL chinese, UIColor *color, 
 }
 
 static void GXKDetachLangKey(void) {
+    GXKClearLangKeyCache(); // 键已撤：定位缓存作废，下次从头认当前布局。
     BOOL wasUpdating = gUpdatingLangKey;
     gUpdatingLangKey = YES;
     UIView *oldKey = gLangKeyView;
@@ -1105,6 +1220,7 @@ static void GXKUpdateLangKey(UIViewController *vc) {
         btn.accessibilityElementsHidden = YES;
         gLangKeyView = currentKey;
         gGuardLangKey = currentKey;
+        GXKClearRebindPending(); // 齿轮键绑上同样结束补绑等待。
         gLangNativeIcon = icon;
         gLangSoftKeyDef = model;
         gLangHost = host;
@@ -1138,6 +1254,11 @@ static void GXKUpdateLangKey(UIViewController *vc) {
 }
 
 static void GXKDetachActionKey(void) {
+    // 键已撤：定位缓存作废，下次从头认当前布局。
+    GXKClearEmojiKeyCache();
+    // 走到这里就是「这次没能接管」：补绑等待窗立即结束，键马上还给原生。
+    // 否则绑定失败的键会被空白挡到等待窗过期（最长 GXK_REBIND_WAIT_SECONDS）。
+    GXKClearRebindPending();
     // 空转必须早退：切页那一串原生刷新里 detach 会被连调十几次，每次都没有绑定。
     // 更关键的是下面的 gFlashDeadline 赋值——没有旧键时它会把刚建立的宽限窗口清零，
     // 于是守卫当场放行，新键的原生圆圈照原样提交一帧。宽限只能由真正的撤键建立。
@@ -1811,6 +1932,7 @@ static void GXKUpdateActionKey(UIViewController *vc) {
         [btn addTarget:gActionTarget action:@selector(onActionKeyTapped:) forControlEvents:UIControlEventTouchUpInside];
         gEmojiSoftKeyView = currentKey;
         gGuardKey = currentKey; // 守卫归属随绑定建立，切页重建图标后仍认这把键。
+        GXKClearRebindPending(); // 已经接上了，补绑等待窗到此为止。
         gActionNativeIcon = icon;
         gActionSoftKeyDef = model;
         gActionHost = host;
@@ -1902,6 +2024,8 @@ static void gkx_viewDidLayoutSubviews(id self, SEL _cmd) {
     gToolbarContentEpoch++;
     // 布局回调一帧内可能来几十次（任何 setNeedsLayout 都会触发）：
     // 合并成一次异步刷新，只保留最后一次，避免同一帧反复全量重算。
+    // 布局变了，键实例可能整批重建：定位缓存全部作废，下一次从头认当前布局。
+    GXKBumpKeyCacheEpoch();
     static NSUInteger gLayoutSeq;
     NSUInteger seq = ++gLayoutSeq;
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -1959,6 +2083,7 @@ static void gkx_viewWillDisappear(id self, SEL _cmd, BOOL animated) {
         gComposingActive = NO; // 扩展隐藏后组字缓存作废，下次出现重新采样。
         gSuggestingActive = NO; // 联想缓存同样作废，避免下次出现误显示「收起」。
         GXKStopPolling();
+        GXKBumpKeyCacheEpoch(); // 键盘撤走：跨会话不沿用上一轮认出来的键实例。
         GXKDetachActionKey();
         GXKClearFlashGrace(); // 扩展隐藏后不再需要补帧窗口，别让它跨会话留到下次出现。
         GXKDetachLangKey(); // 齿轮键覆盖层随键盘一起撤走，原生图标按存档还原。

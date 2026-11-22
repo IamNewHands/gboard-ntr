@@ -182,6 +182,42 @@ class LangKeySourceContracts(unittest.TestCase):
         self.assertIn("GXKClearFlashGrace()", gone)
         self.assertLess(gone.index("GXKDetachActionKey()"), gone.index("GXKClearFlashGrace()"))
 
+    def test_expiry_does_not_hand_the_key_back_while_rebind_is_pending(self):
+        """宽限到点不能立刻还键：那一次 updateView 会把原生笑脸画回去。
+
+        日志 4 的 1.17 秒圆圈就是这段空档——9390 宽限到点还原生、9391 守卫放行、
+        补绑要等下一轮主队列才到。等待窗内改为继续拦，绑上或超时才还。
+        """
+        hold = function_body(self.source, "static BOOL gxk_rebind_hold(UIView *key) {")
+        self.assertIn("gxk_rebind_pending()", hold)
+        self.assertIn("GXKEmojiKeyID", hold)
+        # 等待窗只认「可见九键布局体里的表情键」，不会变成第二条归属。
+        self.assertIn("GXKNineKeyBodyForKey(key, gCurrentVC.view)", hold)
+        expire = function_body(self.source, "static void GXKExpireFlashGraceIfNeeded(void) {")
+        # 交还原生这一步必须被等待窗挡住，且挡在 updateView 之前。
+        self.assertIn("!gxk_rebind_hold(expired)", expire)
+        self.assertLess(expire.index("!gxk_rebind_hold(expired)"), expire.index("updateView]"))
+        # 到点后仍要补绑，不能只拦不绑。
+        self.assertIn("if (!gEmojiSoftKeyView) GXKScheduleActionKeyRebind();", expire)
+        # 等待窗必须有界：超过上限一律还键，绝不长期接管。
+        window = function_body(self.source, "static BOOL gxk_rebind_pending(void) {")
+        self.assertIn("gRebindWaitDeadline > 0", window)
+        self.assertIn("CFAbsoluteTimeGetCurrent() < gRebindWaitDeadline", window)
+        # 写入拦截与守卫都必须认这条等待窗，否则原生图还是能进图层。
+        guarded = function_body(self.source, "static UIView *GXKGuardedKeyForIcon(UIView *icon) {")
+        self.assertIn("gxk_rebind_pending()", guarded)
+        self.assertIn("gxk_rebind_hold(v)", guarded)
+        guard = function_body(self.source, "static void gxk_key_updateView(id self, SEL _cmd) {")
+        self.assertIn("!gxk_rebind_hold(key)", guard)
+        # 绑定成功即结束等待；失败撤键也立即结束，键不会被空白挡到过期。
+        update = function_body(self.source, "static void GXKUpdateActionKey(UIViewController *vc) {")
+        self.assertLess(update.index("gGuardKey = currentKey"), update.index("GXKClearRebindPending()"))
+        detach = function_body(self.source, "static void GXKDetachActionKey(void) {")
+        self.assertLess(detach.index("GXKClearRebindPending()"), detach.index("if (!gEmojiSoftKeyView && !gActionKeyButton"))
+        # 键盘撤走时窗口一并作废。
+        clear = function_body(self.source, "static void GXKClearFlashGrace(void) {")
+        self.assertIn("GXKClearRebindPending()", clear)
+
 
 
 if __name__ == "__main__":
