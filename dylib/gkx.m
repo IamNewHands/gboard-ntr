@@ -614,6 +614,44 @@ static void gxk_lang_updateView(UIView *key);
 static __weak UIView *gFlashKey;
 static CFTimeInterval gFlashDeadline;
 
+// 停放按钮：撤键到补绑之间只有几毫秒（日志 8：det emoji 10972 → hit new key 10975），
+// 但按钮一旦摘走，这几毫秒键上就是原生内容——用户看到的就是「换行」两个字闪一下。
+// 撤键时先把按钮停放在原地、不摘不隐藏，补绑时直接认领；停放超时没人认领才真正移除。
+#define GXK_PARK_SECONDS 0.10
+static UIButton *gParkedButton;
+static NSUInteger gParkSeq;
+static void GXKUnparkActionButton(void) {
+    gParkSeq++;
+    UIButton *parked = gParkedButton;
+    gParkedButton = nil;
+    // 作废停放必须连带把按钮摘掉：只清指针会让它永远留在屏幕上（计时器已因 seq 变化失效）。
+    if (parked) [parked removeFromSuperview];
+}
+static void GXKParkActionButton(UIButton *btn) {
+    if (!btn) return;
+    // 只丢弃上一枚停放按钮，不能走 GXKUnparkActionButton：那会把正要停放的这枚也摘掉。
+    gParkSeq++;
+    UIButton *previous = gParkedButton;
+    gParkedButton = nil;
+    if (previous && previous != btn) [previous removeFromSuperview];
+    gParkedButton = btn;
+    NSUInteger seq = gParkSeq;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(GXK_PARK_SECONDS * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (seq != gParkSeq) return; // 已被认领或又被停放一次
+        UIButton *parked = gParkedButton;
+        gParkedButton = nil;
+        [parked removeFromSuperview];
+    });
+}
+// 认领停放按钮：同一帧补绑就直接复用它，屏幕上的字一次都没消失过。
+static UIButton *GXKTakeParkedButton(void) {
+    UIButton *btn = gParkedButton;
+    gParkedButton = nil;
+    gParkSeq++; // 作废计时器，但绝不摘按钮：它马上要在新键上继续显示。
+    return btn;
+}
+
 // 补绑等待窗：宽限到点时键可能还没有归属（原生把键重建成新实例，绑定要等下一拍布局）。
 // 这期间若放行，原生就把笑脸原样画上去——日志 4 里 9391 到 10560 那 1.17 秒的圆圈，
 // 就是「宽限到点先还原生、补绑再下一轮才到」的空档。
@@ -1305,6 +1343,7 @@ static void GXKDetachActionKey(void) {
     UIImage *highlightedImage = gActionHighlightedImage;
     id oldModel = gActionSoftKeyDef;
     UIButton *oldButton = gActionKeyButton;
+    UIView *oldHost = gActionHost;
     gEmojiSoftKeyView = nil;
     gActionNativeIcon = nil;
     gActionNormalImage = nil;
@@ -1317,7 +1356,22 @@ static void GXKDetachActionKey(void) {
     // 按钮一摘，它就露出来一帧——这是切页闪笑脸的直接来源。
     UIView<GXKNativeIconContent> *staleIcon = oldKey ? GXKNativeIconForKey(oldKey) : nil;
     if (staleIcon) GXKClearIconImages(staleIcon);
-    [oldButton removeFromSuperview];
+    // 切页这一拍撤键是「临时」的：几毫秒后同一把键会被重新认领（日志 8 里 3 毫秒）。
+    // 这种情况按钮原地停放，不摘不隐藏——摘掉的那几帧键上没有我们的字，露出的就是原生内容。
+    // 只有旧键仍在当前根视图里可见、模型仍是原生表情时才停放；真换了布局（26 键、符号页）
+    // 或键已经离屏，就照旧立即移除，绝不留一个错位的按钮盖在新键上。
+    BOOL transient = oldKey && oldButton && oldModel && oldHost &&
+                     GXKModelHasNativeActions(oldModel) &&
+                     gCurrentVC && gCurrentVC.isViewLoaded &&
+                     [oldKey isDescendantOfView:gCurrentVC.view] &&
+                     GXKKeyIsVisible(oldKey, gCurrentVC.view) &&
+                     oldButton.superview == oldHost;
+    if (transient) {
+        GXKParkActionButton(oldButton);
+    } else {
+        GXKUnparkActionButton();
+        [oldButton removeFromSuperview];
+    }
     // 切页宽限：这把键刚被撤，原生接下来几帧还会重画它。窗口内守卫继续把原生圆圈搬走，
     // 用户看不到那一帧；窗口一到守卫立即放行并还原前景，不会长期停在没有图标的状态。
     gFlashKey = oldKey;
@@ -1961,16 +2015,38 @@ static void GXKUpdateActionKey(UIViewController *vc) {
         gUpdatingActionKey = NO;
         return;
     }
-    // 同一个键、同一个模型，只是原生把前景图标对象重建了（切页/主题刷新都会这么干）：
-    // 归属本来还在，撤掉再绑只会平白给原生一个「没有归属」的窗口，那几帧就是圆圈。
-    // 直接把归属换到新图标上，走下面同一段收尾（搬走原生刚画的前景、对齐位置与标题）。
-    BOOL iconRebuilt = (gEmojiSoftKeyView == currentKey) && (gActionSoftKeyDef == model) &&
-                       (gActionNativeIcon != icon) && gActionKeyButton &&
-                       gActionKeyButton.superview == host;
-    if (iconRebuilt) gActionNativeIcon = icon;
-    if (!iconRebuilt &&
-        (gEmojiSoftKeyView != currentKey || gActionNativeIcon != icon || gActionSoftKeyDef != model ||
-         !gActionKeyButton || gActionKeyButton.superview != host)) {
+    // 绑定需要更新时，先看能不能「软重绑」：按钮已经在屏幕上、新键也确实是可接管的
+    // 原生表情键，就直接把归属换过去，不撤键、不摘按钮、不调原生还原。
+    // 撤键要摘按钮再重建，中间那几帧键上没有我们的字，露出的就是原生文字/图标——
+    // 日志 8 里 10 次切页都是 det emoji 后紧跟着一次原生重画，用户看到的就是「换行」闪一下。
+    BOOL sameBinding = (gEmojiSoftKeyView == currentKey) && (gActionNativeIcon == icon) &&
+                       (gActionSoftKeyDef == model) && gActionKeyButton &&
+                       (gActionKeyButton.superview == host);
+    BOOL canRetarget = !sameBinding && gActionKeyButton && host &&
+                       GXKModelHasNativeActions(model) && [color isKindOfClass:[UIColor class]];
+    if (canRetarget) {
+        UIView *retireKey = gEmojiSoftKeyView;
+        UIView<GXKNativeIconContent> *retireIcon = gActionNativeIcon;
+        if (retireKey && retireKey != currentKey) {
+            // 旧键上残留的前景必须清掉，松开归属后它不该再露出来。
+            UIView<GXKNativeIconContent> *stale = retireIcon ?: GXKNativeIconForKey(retireKey);
+            if (stale) GXKClearIconImages(stale);
+            // 旧键仍在被原生重画：照旧给它一段宽限，别让这一帧的原生图漏出去。
+            gFlashKey = retireKey;
+            gFlashDeadline = CFAbsoluteTimeGetCurrent() + GXK_FLASH_GRACE_SECONDS;
+            // 前景存档属于旧键，不能拿去还原新键。
+            gActionNormalImage = nil;
+            gActionHighlightedImage = nil;
+        }
+        gEmojiSoftKeyView = currentKey;
+        gGuardKey = currentKey;
+        gActionNativeIcon = icon;
+        gActionSoftKeyDef = model;
+        gActionHost = host;
+        GXKClearRebindPending();
+        if (gActionKeyButton.superview != host) [host addSubview:gActionKeyButton];
+        GXKPunctDiagLog(@"retarget %@", currentKey.restorationIdentifier);
+    } else if (!sameBinding) {
         GXKDetachActionKey();
         // 原生updateView会应用布局/可见性属性：重新验证控制器、root及完整当前目标。
         if (vc != gCurrentVC || !vc.isViewLoaded || vc.view != root) {
@@ -1995,8 +2071,15 @@ static void GXKUpdateActionKey(UIViewController *vc) {
             return;
         }
         if (!gActionTarget) gActionTarget = [[GXKActionKeyTarget alloc] init];
-        // 每次新绑定使用新按钮，旧TouchUp不能跟随复用的UIButton落到另一个键。
-        UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
+        // 刚撤下的按钮还在停放里：直接认领，屏幕上的字一次都不消失（这是「换行闪一下」的根治点）。
+        // 认领前先清掉旧键残留的触控状态，点击语义仍由 onActionKeyTapped 现取当前模型决定。
+        UIButton *btn = GXKTakeParkedButton();
+        if (!btn) {
+            // 每次新绑定使用新按钮，旧TouchUp不能跟随复用的UIButton落到另一个键。
+            btn = [UIButton buttonWithType:UIButtonTypeCustom];
+        } else {
+            [btn removeTarget:nil action:NULL forControlEvents:UIControlEventAllEvents];
+        }
         btn.tag = GXK_ACTION_TAG;
         btn.backgroundColor = [UIColor clearColor];
         btn.adjustsImageWhenHighlighted = NO;
@@ -2123,6 +2206,7 @@ static void gkx_viewWillAppear(id self, SEL _cmd, BOOL animated) {
     if (gOrigViewWillAppear) gOrigViewWillAppear(self, _cmd, animated);
     if ((UIViewController *)self != gCurrentVC) {
         GXKDetachActionKey();
+        GXKUnparkActionButton(); // 换控制器了，停放的按钮不再属于任何一把键。
         GXKDetachLangKey();
         GXKDetachToolbar();
     }
@@ -2160,6 +2244,7 @@ static void gkx_viewWillDisappear(id self, SEL _cmd, BOOL animated) {
         GXKStopPolling();
         GXKBumpKeyCacheEpoch(); // 键盘撤走：跨会话不沿用上一轮认出来的键实例。
         GXKDetachActionKey();
+        GXKUnparkActionButton(); // 键盘撤走，停放中的按钮不能留在屏幕上。
         GXKClearFlashGrace(); // 扩展隐藏后不再需要补帧窗口，别让它跨会话留到下次出现。
         GXKDetachLangKey(); // 齿轮键覆盖层随键盘一起撤走，原生图标按存档还原。
         GXKDetachToolbar(); // 扩展隐藏后工具条随宿主一起撤走，下次出现重新定位。
