@@ -51,11 +51,14 @@
     self = [super initWithFrame:frame];
     if (self) {
         _foregroundColor = UIColor.darkGrayColor;
+        // Do NOT set this view as the extra layers' delegate. GKBImageLayer already
+        // returns nil from -actionForKey:, so the delegate adds nothing — but a UIView
+        // delegate on a non-backing layer makes UIKit's subtree walk revisit
+        // view.layer -> _backgroundLayer -> delegate view -> view.layer, which is the
+        // unbounded _makeSubTreePerformSelector recursion behind the CI SIGSEGV.
         _backgroundLayer = [[GKBImageLayer alloc] init];
-        _backgroundLayer.delegate = self;
         [self.layer addSublayer:_backgroundLayer];
         _fixtureMaskLayer = [[GKBImageLayer alloc] init];
-        _fixtureMaskLayer.delegate = self;
         // Keep the default icon unmasked so raster positive controls are meaningful.
         // Only the layer-identity test installs this separate mask.
         self.userInteractionEnabled = NO;
