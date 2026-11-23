@@ -306,6 +306,12 @@ static NSUInteger GXKFixtureBluePixels(NSData *data) {
 - (void)setUp {
     [super setUp];
     XCTAssertTrue(NSThread.isMainThread, @"UIKit fixture must execute on the main thread.");
+    GXKDebugNativePhase("before pre-hook key probe");
+    GKBSoftKeyView *probeKey = [GKBSoftKeyView alloc];
+    GXKDebugNativePhase("after pre-hook key alloc");
+    probeKey = [probeKey initWithFrame:CGRectMake(0, 0, 10, 10)];
+    GXKDebugNativePhase("after pre-hook key probe");
+    probeKey = nil;
     GXKDebugNativePhase("before hook installation");
     GXKInstallIconWriteGuard(); // Install the actual production native/key/layer hooks.
     GXKDebugNativePhase("after hook installation");
@@ -365,14 +371,22 @@ static NSUInteger GXKFixtureBluePixels(NSData *data) {
     return model;
 }
 - (GKBSoftKeyView *)makeKey:(NSString *)identity separateHost:(BOOL)separate attach:(BOOL)attach {
-    GKBSoftKeyView *key = [[GKBSoftKeyView alloc] initWithFrame:CGRectMake(330, 145, 48, 44)];
+    GXKDebugNativePhase("before key alloc");
+    GKBSoftKeyView *key = [GKBSoftKeyView alloc];
+    GXKDebugNativePhase("after key alloc");
+    key = [key initWithFrame:CGRectMake(330, 145, 48, 44)];
+    GXKDebugNativePhase("after key init");
     key.restorationIdentifier = identity;
+    GXKDebugNativePhase("after identity assignment");
     if (separate) {
         key.separateHost = [[UIView alloc] initWithFrame:key.bounds];
         key.separateHost.userInteractionEnabled = NO;
         [key addSubview:key.separateHost];
     }
-    key.softKeyDef = [self modelWithActions:@[@"native-action"] layout:@"icon"];
+    GXKFixtureSoftKeyDef *model = [self modelWithActions:@[@"native-action"] layout:@"icon"];
+    GXKDebugNativePhase("after model creation");
+    key.softKeyDef = model;
+    GXKDebugNativePhase("after model assignment");
     if (attach) [self.body addSubview:key];
     return key;
 }
