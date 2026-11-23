@@ -11,35 +11,28 @@ A no-source reverse-engineering patch for the official **iOS Gboard 2.3.19**: an
 ## What it does
 
 **1. Bundled Rime "Wanxiang" dictionary**
-60,000 curated entries (45k high-frequency words, 10k idioms, 3k place names, 2k abbreviations). Redundant Protobuf fields are dropped, shrinking the file to 1.61 MB. The extension copies it into the App Group container on first launch; it ships once, in the main app's `Frameworks/`, so install size is not inflated.
+60,000 curated entries, slimmed down to a 1.61 MB file. Copied into the App Group container on first launch, so it works out of the box without inflating the install size.
 
 **2. Nine-key action key: retype / dismiss / newline**
-Only the native emoji key on the nine-key layout and its symbol pages is replaced; the 26-key layout and the return key stay untouched.
-- Composing → **重输 (retype)**, clearing the uncommitted Pinyin
-- Suggestions without composition → **收起 (dismiss)**
-- Idle → **换行 (newline)**
-
-The native background, border and theme are preserved; only the foreground text changes. Switching pages no longer flashes the native emoji for a frame.
+Only the native emoji key on the nine-key layout and its symbol pages is replaced; the 26-key layout and the return key stay untouched. It shows **重输 (retype)** while composing, **收起 (dismiss)** when there are suggestions but no composition, and **换行 (newline)** when idle. Native background and colours are preserved, with no added height or occlusion, and switching pages no longer flashes the native emoji.
 
 **3. G-logo page trimming**
-The YouTube, Contacts, GIF and Sticker pages are removed, leaving emoji, kaomoji and the built-in pages. If a class disappears in a future Gboard build, that layer is skipped and behaviour degrades to native.
+The YouTube, Contacts, GIF and Sticker pages are removed, leaving emoji, kaomoji and the built-in pages. Any class missing from a future Gboard build is skipped.
 
 **4. Phrases**
-A "常用语" page is added to the G-logo picker and follows the keyboard skin. With pinning off, tapping a phrase inserts it and closes the panel; with pinning on, the panel stays open. The editor opens inside the keyboard itself; the main app's Settings → Gboard → Phrases is a second entry point.
+A "常用语" page is added to the G-logo picker and follows the keyboard skin. With pinning off, tapping a phrase inserts it and closes the panel; with pinning on, the panel stays open. It can be edited inside the keyboard, and Settings → Gboard → Phrases in the main app is a second entry point.
 
 **5. Punctuation long-press popup**
 Holding the nine-key "，。？！" key for 0.32 s shows a row of symbols; slide to one and release to insert it. The symbol list and the count (1–10) are editable in the main app, and the colours follow the keyboard skin.
 
 **6. Diagnostic log (off by default)**
-While off, no views are created and no strings are built. The switch lives in Settings → Gboard → Diagnostic log and takes effect across processes within half a second.
+Nothing is recorded by default. The switch lives in Settings → Gboard → Diagnostic log and takes effect across processes within half a second.
 
 **7. Map page**
-Fully reverted to native. A keyboard extension cannot open the location settings page, so the earlier detour never worked on device and was removed entirely.
+Fully reverted to native, with no redirection.
 
 **8. "中/英" label on the language key**
-The language key (4th key of the nine-key left column and the top-right key of the 26-key layout) ships with a globe icon only. It now shows 中 and 英, the current language fully opaque and the other dimmed, with the native font and colours. The overlay is purely visual: touches still reach the native key underneath and language switching stays on the native path.
-
-Each key owns its own overlay as a subview, so the same turn that native redraws or re-fronts the key puts the overlay back on top — no polling catch-up frame. Switching language or pages no longer flashes the native globe.
+The language key (4th key of the nine-key left column and the top-right key of the 26-key layout) ships with a globe icon only; it now shows 中 and 英, the current language fully opaque and the other dimmed. The overlay is purely visual — touches and language switching stay on the native path — and switching language or pages no longer flashes the globe.
 
 ---
 
