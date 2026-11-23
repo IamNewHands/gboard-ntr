@@ -97,8 +97,9 @@ jobs:
         run: |
           set -euo pipefail
           SHORT="${GITHUB_SHA::7}"
-          git config user.name "gkx-ci"
-          git config user.email "gkx-ci@users.noreply.github.com"
+          # 用仓库主账号的 noreply 身份提交，避免再造出可被别人认领的 noreply 邮箱。
+          git config user.name "IamNewHands"
+          git config user.email "165129054+IamNewHands@users.noreply.github.com"
           git checkout --orphan builds-tmp
           git rm -rf --cached . >/dev/null
           mkdir -p builds

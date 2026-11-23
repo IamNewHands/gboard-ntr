@@ -1,0 +1,14 @@
+# 作者归属统一表（.mailmap）
+#
+# 背景：本仓库历史上有几组非账号身份，其中 gkx@users.noreply.github.com 会被
+# GitHub 按 noreply 规则映射到真实账号 gkx (uid 9195569)，使一个从未参与本
+# 项目的人出现在 Contributors 列表。gkx@local / agent@local / gkx-ci@users.noreply
+# 虽不会映射到他人，也一并归到仓库主账号，保证统计口径一致。
+#
+# .mailmap 只影响 git 的显示与统计归属（%aN/%aE）以及 GitHub 的贡献者归属，
+# 不改写任何提交对象，历史 SHA 保持不变。
+
+IamNewHands <165129054+IamNewHands@users.noreply.github.com> <gkx@users.noreply.github.com>
+IamNewHands <165129054+IamNewHands@users.noreply.github.com> <gkx@local>
+IamNewHands <165129054+IamNewHands@users.noreply.github.com> <agent@local>
+IamNewHands <165129054+IamNewHands@users.noreply.github.com> <gkx-ci@users.noreply.github.com>
