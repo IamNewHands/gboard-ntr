@@ -2334,7 +2334,8 @@ static void GXKInsertPhraseText(NSString *text) {
 
 // 编辑入口：键盘面板右上角「编辑」与主 App 设置主菜单里的「常用语」共用这一个函数。
 static void GXKPresentPhrasesEditor(UIViewController *from);
-static void GXKPresentPunctEditor(UIViewController *from, id collectionView, id indexPath);
+static void GXKPresentPunctEditor(UIViewController *from, id collectionView, id indexPath,
+                                  GXKPunctPage page);
 
 @interface GXKPhrasesPanel : UIView <UITableViewDataSource, UITableViewDelegate>
 @property (nonatomic, strong) UITableView *table;
@@ -2713,6 +2714,7 @@ static void GXKInstallPhrasesHooks(void) {
 static NSString *const GXKPhrasesRowKey = @"GXKPhrasesRow";
 static NSString *const GXKDiagRowKey = @"GXKDiagRow";
 static NSString *const GXKPunctRowKey = @"GXKPunctRow";
+static NSString *const GXKPunctDigitRowKey = @"GXKPunctDigitRow";
 static NSString *const GXKDiagLogKey = @"GXKDiagLogEnabled";
 
 // 这些类在 dylib 里没有头文件，一律用 objc_msgSend 显式取，避免编译器按静态类型挑方法。
@@ -2761,11 +2763,12 @@ static id GXKPhrasesRowTemplate(NSArray *sections, id *outSection) {
     return fallback;
 }
 
-// 我们自己的行：常用语、诊断日志、标点弹层。三者共用同一套复制原生行的注入方式。
+// 我们自己的行：常用语、诊断日志、标点弹层（拼音页）、标点弹层（数字页）。
+// 共用同一套复制原生行的注入方式。
 static BOOL GXKKeyIsOurs(NSString *key) {
     if (!key) return NO;
     return [key isEqualToString:GXKPhrasesRowKey] || [key isEqualToString:GXKDiagRowKey] ||
-           [key isEqualToString:GXKPunctRowKey];
+           [key isEqualToString:GXKPunctRowKey] || [key isEqualToString:GXKPunctDigitRowKey];
 }
 
 static BOOL GXKSettingsRowIsOurs(id row) {
@@ -2802,12 +2805,14 @@ static NSString *GXKDiagRowTitle(void) {
     return GXKDiagLogOn() ? @"诊断日志（开）" : @"诊断日志（关）";
 }
 
-// 标题带状态：不点进去也能看出弹层现在几格。
-static NSString *GXKPunctRowTitle(void) {
-    return [NSString stringWithFormat:@"标点长按弹层（%lu 个）", (unsigned long)GXKPunctCandidates().count];
+// 标题带状态：不点进去也能看出弹层现在几格。两页各占一行，标题前缀区分开。
+static NSString *GXKPunctRowTitle(GXKPunctPage page) {
+    NSString *name = (page == GXKPunctPageDigit) ? @"数字页标点弹层" : @"标点长按弹层";
+    return [NSString stringWithFormat:@"%@（%lu 个）", name,
+                                      (unsigned long)GXKPunctCandidatesForPage(page).count];
 }
 
-static id GXKPunctSettingsRow(id template) {
+static id GXKPunctSettingsRow(id template, GXKPunctPage page) {
     Class itemClass = NSClassFromString(@"GKBSettingsItem");
     if (!itemClass || !template) return nil;
     long long type = 0;
@@ -2818,9 +2823,12 @@ static id GXKPunctSettingsRow(id template) {
     if ([template respondsToSelector:@selector(settingID)]) {
         settingID = ((long long (*)(id, SEL))objc_msgSend)(template, @selector(settingID));
     }
+    BOOL digit = (page == GXKPunctPageDigit);
     return ((id (*)(id, SEL, long long, long long, id, id, id))objc_msgSend)(
         [itemClass alloc], @selector(initWithType:settingID:title:accessibilityIdentifier:key:),
-        type, settingID, GXKPunctRowTitle(), @"gxk_punct_row", GXKPunctRowKey);
+        type, settingID, GXKPunctRowTitle(page),
+        digit ? @"gxk_punct_digit_row" : @"gxk_punct_row",
+        digit ? GXKPunctDigitRowKey : GXKPunctRowKey);
 }
 
 // 幂等：descriptor 每次打开设置都会重新生成，所以每次调用都检查一遍。
@@ -2851,11 +2859,12 @@ static void GXKInjectPhrasesRow(id descriptor) {
     }
     NSArray *rows = GXKRowsOf(targetSection);
     if (!rows) return;
-    NSMutableArray *newRows = [NSMutableArray arrayWithCapacity:rows.count + 3];
+    NSMutableArray *newRows = [NSMutableArray arrayWithCapacity:rows.count + 4];
     NSUInteger insertAt = rows.count;
     BOOL hasPhrases = NO;
     BOOL hasDiag = NO;
     BOOL hasPunct = NO;
+    BOOL hasPunctDigit = NO;
     for (NSUInteger i = 0; i < rows.count; i++) {
         id row = rows[i];
         NSString *key = GXKKeyOf(row);
@@ -2863,17 +2872,22 @@ static void GXKInjectPhrasesRow(id descriptor) {
             if ([key isEqualToString:GXKPhrasesRowKey]) hasPhrases = YES;
             if ([key isEqualToString:GXKDiagRowKey]) hasDiag = YES;
             if ([key isEqualToString:GXKPunctRowKey]) hasPunct = YES;
+            if ([key isEqualToString:GXKPunctDigitRowKey]) hasPunctDigit = YES;
         }
         [newRows addObject:row];
         if (row == template) insertAt = i + 1;
     }
-    NSMutableArray *ours = [NSMutableArray arrayWithCapacity:3];
+    NSMutableArray *ours = [NSMutableArray arrayWithCapacity:4];
     if (!hasPhrases) {
         id row = GXKPhrasesSettingsRow(template);
         if (row) [ours addObject:row];
     }
     if (!hasPunct) {
-        id row = GXKPunctSettingsRow(template);
+        id row = GXKPunctSettingsRow(template, GXKPunctPagePinyin);
+        if (row) [ours addObject:row];
+    }
+    if (!hasPunctDigit) {
+        id row = GXKPunctSettingsRow(template, GXKPunctPageDigit);
         if (row) [ours addObject:row];
     }
     if (!hasDiag) {
@@ -2886,7 +2900,7 @@ static void GXKInjectPhrasesRow(id descriptor) {
         NSMakeRange(insertAt, ours.count)]];
     if (![targetSection respondsToSelector:@selector(setRows:)]) return;
     ((void (*)(id, SEL, id))objc_msgSend)(targetSection, @selector(setRows:), newRows);
-    GXK_LOG(@"[*] 设置主菜单已插入 %lu 行（常用语/标点弹层/诊断日志）", (unsigned long)ours.count);
+    GXK_LOG(@"[*] 设置主菜单已插入 %lu 行（常用语/标点弹层/数字页弹层/诊断日志）", (unsigned long)ours.count);
 }
 
 static id gxk_settingsMainMenu(id self, SEL _cmd) {
@@ -3045,9 +3059,10 @@ static BOOL GXKIsPhrasesRowSelected(id self, id collectionView, id indexPath) {
     return GXKCellShowsPhrasesTitle(collectionView, indexPath);
 }
 
-// 「标点长按弹层」那一行：只按 key 认，没有文字兜底（标题里带数字，逐字比对不划算）。
-static BOOL GXKIsPunctRowSelected(id self, id collectionView, id indexPath) {
-    return [GXKKeyOf(GXKDescriptorRowAt(self, indexPath)) isEqualToString:GXKPunctRowKey];
+// 「标点长按弹层」那两行：只按 key 认，没有文字兜底（标题里带数字，逐字比对不划算）。
+// 拼音页与数字页各占一行，同一个判定函数带上目标 key 就行。
+static BOOL GXKIsPunctRowSelected(id self, id collectionView, id indexPath, NSString *rowKey) {
+    return [GXKKeyOf(GXKDescriptorRowAt(self, indexPath)) isEqualToString:rowKey];
 }
 
 static void gxk_settingsPageDidSelect(id self, SEL _cmd, id collectionView, id indexPath) {
@@ -3061,13 +3076,16 @@ static void gxk_settingsPageDidSelect(id self, SEL _cmd, id collectionView, id i
         }
         return;
     }
-    if (GXKIsPunctRowSelected(self, collectionView, indexPath)) {
+    if (GXKIsPunctRowSelected(self, collectionView, indexPath, GXKPunctRowKey) ||
+        GXKIsPunctRowSelected(self, collectionView, indexPath, GXKPunctDigitRowKey)) {
         if ([collectionView respondsToSelector:@selector(deselectItemAtIndexPath:animated:)]) {
             ((void (*)(id, SEL, id, BOOL))objc_msgSend)(
                 collectionView, @selector(deselectItemAtIndexPath:animated:), indexPath, NO);
         }
         if ([self isKindOfClass:[UIViewController class]]) {
-            GXKPresentPunctEditor((UIViewController *)self, collectionView, indexPath);
+            BOOL digit = GXKIsPunctRowSelected(self, collectionView, indexPath, GXKPunctDigitRowKey);
+            GXKPresentPunctEditor((UIViewController *)self, collectionView, indexPath,
+                                  digit ? GXKPunctPageDigit : GXKPunctPagePinyin);
         }
         return;
     }
@@ -3309,6 +3327,7 @@ static void GXKPresentPhrasesEditor(UIViewController *from) {
 @property (nonatomic, strong) UITableView *table;
 @property (nonatomic, strong) NSMutableArray<NSString *> *symbols;
 @property (nonatomic, assign) NSInteger count;
+@property (nonatomic, assign) GXKPunctPage page; // 编辑的是拼音页还是数字页那一套表
 @property (nonatomic, assign) BOOL dismissable;
 @property (nonatomic, assign) BOOL darkAppearance;
 @property (nonatomic, strong) UIColor *nativeTextColor;
@@ -3319,9 +3338,11 @@ static void GXKPresentPhrasesEditor(UIViewController *from) {
 - (instancetype)init {
     self = [super initWithNibName:nil bundle:nil];
     if (!self) return nil;
+    // 默认拼音页；调用方若编辑的是数字页，会在 present 之前写 page，setter 再按页重填一次。
+    _page = GXKPunctPagePinyin;
     self.title = @"标点长按弹层";
-    _symbols = [GXKPunctSymbols() mutableCopy];
-    _count = GXKPunctSymbolCount();
+    _symbols = [GXKPunctSymbolsForPage(_page) mutableCopy];
+    _count = GXKPunctSymbolCountForPage(_page);
     if (_count > (NSInteger)_symbols.count) _count = (NSInteger)_symbols.count;
     return self;
 }
@@ -3377,17 +3398,27 @@ static void GXKPresentPhrasesEditor(UIViewController *from) {
     [self dismissViewControllerAnimated:YES completion:nil];
 }
 
+// 页在 init 之后才由调用方写入，所以这里补一次重填：符号表与个数都跟着页走。
+- (void)setPage:(GXKPunctPage)page {
+    _page = page;
+    self.title = (page == GXKPunctPageDigit) ? @"数字页标点弹层" : @"标点长按弹层";
+    self.symbols = [GXKPunctSymbolsForPage(page) mutableCopy];
+    self.count = GXKPunctSymbolCountForPage(page);
+    if (_count > (NSInteger)_symbols.count) _count = (NSInteger)_symbols.count;
+    if (self.isViewLoaded) [self.table reloadData];
+}
+
 - (void)onReset:(id)sender {
-    GXKPunctResetSettings();
-    self.symbols = [GXKPunctDefaultSymbols() mutableCopy];
+    GXKPunctResetSettings(self.page);
+    self.symbols = [GXKPunctDefaultForPage(self.page) mutableCopy];
     self.count = (NSInteger)self.symbols.count;
     [self.table reloadData];
-    GXK_LOG(@"[*] 标点弹层已复位为默认符号表");
+    GXK_LOG(@"[*] 标点弹层已复位为默认符号表（page=%ld）", (long)self.page);
 }
 
 // 写盘后再刷新：先落 App Group，键盘侧下一次长按就是新表。
 - (void)gxkPersist {
-    GXKPunctSaveSettings(self.symbols, self.count);
+    GXKPunctSaveSettings(self.page, self.symbols, self.count);
     [self.table reloadData];
 }
 
@@ -3541,23 +3572,25 @@ static void GXKPresentPhrasesEditor(UIViewController *from) {
 
 @end
 
-static void GXKPresentPunctEditor(UIViewController *from, id collectionView, id indexPath) {
+static void GXKPresentPunctEditor(UIViewController *from, id collectionView, id indexPath,
+                                  GXKPunctPage page) {
     if (!from) return;
     // 标题里带当前格数，改完就地刷新，不用重开设置页。
     id row = GXKDescriptorRowAt(from, indexPath);
     if ([row respondsToSelector:@selector(setTitle:)]) {
-        ((void (*)(id, SEL, id))objc_msgSend)(row, @selector(setTitle:), GXKPunctRowTitle());
+        ((void (*)(id, SEL, id))objc_msgSend)(row, @selector(setTitle:), GXKPunctRowTitle(page));
     }
     UIViewController *host = from;
     while (host.presentedViewController && host.presentedViewController != host) {
         host = host.presentedViewController;
     }
     GXKPunctEditorController *editor = [[GXKPunctEditorController alloc] init];
+    editor.page = page; // 先定页：setter 会按页重填符号表与个数
     editor.dismissable = YES;
     UINavigationController *wrapper = [[UINavigationController alloc] initWithRootViewController:editor];
     wrapper.modalPresentationStyle = UIModalPresentationFullScreen;
     [host presentViewController:wrapper animated:YES completion:nil];
-    GXK_LOG(@"[*] 标点弹层设置已弹出");
+    GXK_LOG(@"[*] 标点弹层设置已弹出（page=%ld）", (long)page);
 }
 
 #pragma mark - 隐私上报拦截 (只掐 clearcut 与 Breakpad 上报)

@@ -53,26 +53,71 @@ class PunctSettingsTest(unittest.TestCase):
         self.assertIn("GXK_PUNCT_MAX_SYMBOLS  10", self.popup)
 
     def test_count_is_clamped(self) -> None:
-        body = function_body(self.popup, "static NSInteger GXKPunctSymbolCount(void)")
-        self.assertIn("integerForKey:GXK_PUNCT_COUNT_KEY", body)
+        body = function_body(self.popup,
+                             "static NSInteger GXKPunctSymbolCountForPage(GXKPunctPage page)")
+        self.assertIn("integerForKey:GXKPunctCountKey(page)", body)
         # 没设过或写了非正数：回退全显示（旧行为）；超过上限：截到上限。
         self.assertIn("n = GXK_PUNCT_MAX_SYMBOLS", body)
         self.assertIn("if (n > GXK_PUNCT_MAX_SYMBOLS)", body)
+
+    def test_page_is_told_apart_by_the_label_on_the_key(self) -> None:
+        # 两页共用同一个 restorationIdentifier，唯一的区别是这一格印的字：
+        # 拼音页一个字（「，」或英文系统下的 ","），数字页是 ",.;:" 四个字符。
+        # 不能用「首字符是否 ASCII」——英文系统下拼音页也是 ASCII，会误判成数字页。
+        body = function_body(self.popup, "static GXKPunctPage GXKPunctPageForKey(UIView *key)")
+        self.assertIn('contents[@"label"]', body)
+        self.assertIn("text.length > 1 ? GXKPunctPageDigit : GXKPunctPagePinyin", body)
+        self.assertNotIn("characterAtIndex:0", body)
+        # 读不到字时保持上一次判定，不退回固定页——猜错会让数字页弹出中文表。
+        self.assertIn("return gPunctPage;", body)
+        self.assertNotIn("return GXKPunctPagePinyin;", body)
+
+    def test_digit_page_has_its_own_ascii_table(self) -> None:
+        # 数字页那一格键帽印的是 ASCII ",.;:"，弹全角中文标点会和键帽对不上，
+        # 所以两页默认表必须不同：拼音页中文、数字页纯 ASCII。
+        body = function_body(self.popup,
+                             "static NSArray<NSString *> *GXKPunctDigitDefaultSymbols(void)")
+        listed = body[body.index("@["):body.index("];")]
+        self.assertEqual(listed.count('@"'), 10)
+        for symbol in [",", ".", ";", ":", "?", "!", "~", "-", "_", "'"]:
+            self.assertIn('@"' + symbol + '"', listed)
+        for symbol in DEFAULT_SYMBOLS:
+            self.assertNotIn('@"' + symbol + '"', listed)
+        picker = function_body(self.popup,
+                               "static NSArray<NSString *> *GXKPunctDefaultForPage(GXKPunctPage page)")
+        self.assertIn("GXKPunctPageDigit ? GXKPunctDigitDefaultSymbols()", picker)
+
+    def test_the_two_pages_never_share_settings_keys(self) -> None:
+        # 改数字页不能动到拼音页，反之亦然：两页的键名必须完全不相交。
+        symbols_key = function_body(self.popup,
+                                    "static NSString *GXKPunctSymbolsKey(GXKPunctPage page)")
+        count_key = function_body(self.popup,
+                                  "static NSString *GXKPunctCountKey(GXKPunctPage page)")
+        self.assertIn("GXKPunctPageDigit ? GXK_PUNCT_DIGIT_SYMBOLS_KEY : GXK_PUNCT_SYMBOLS_KEY",
+                      symbols_key)
+        self.assertIn("GXKPunctPageDigit ? GXK_PUNCT_DIGIT_COUNT_KEY : GXK_PUNCT_COUNT_KEY", count_key)
+        self.assertIn('@"GXKPunctDigitSymbols"', self.popup)
+        self.assertIn('@"GXKPunctDigitCount"', self.popup)
+        # 复位只删本页两个键，不能顺手把另一页也清掉。
+        reset = function_body(self.popup, "static void GXKPunctResetSettings(GXKPunctPage page)")
+        self.assertIn("removeObjectForKey:GXKPunctSymbolsKey(page)", reset)
+        self.assertIn("removeObjectForKey:GXKPunctCountKey(page)", reset)
 
     def test_settings_live_in_app_group(self) -> None:
         defaults = function_body(self.popup, "static NSUserDefaults *GXKPunctDefaults(void)")
         self.assertIn("initWithSuiteName:GXKGroup", defaults)
         save = function_body(self.popup, "static void GXKPunctSaveSettings(")
-        self.assertIn("GXK_PUNCT_SYMBOLS_KEY", save)
-        self.assertIn("GXK_PUNCT_COUNT_KEY", save)
+        self.assertIn("forKey:GXKPunctSymbolsKey(page)", save)
+        self.assertIn("forKey:GXKPunctCountKey(page)", save)
         self.assertIn("synchronize", save)  # 主 App 写、键盘读，必须立刻可见。
         reset = function_body(self.popup, "static void GXKPunctResetSettings(")
-        self.assertIn("removeObjectForKey:GXK_PUNCT_SYMBOLS_KEY", reset)
-        self.assertIn("removeObjectForKey:GXK_PUNCT_COUNT_KEY", reset)
+        self.assertIn("removeObjectForKey:GXKPunctSymbolsKey(page)", reset)
+        self.assertIn("removeObjectForKey:GXKPunctCountKey(page)", reset)
 
     def test_candidates_reuse_identity_until_content_changes(self) -> None:
         # 调用方靠指针比较决定要不要重建格子，所以内容没变就不能换对象。
-        body = function_body(self.popup, "static NSArray<NSString *> *GXKPunctCandidates(void)")
+        body = function_body(self.popup,
+                             "static NSArray<NSString *> *GXKPunctCandidatesForPage(GXKPunctPage page)")
         self.assertIn("CACurrentMediaTime", body)
         self.assertIn("0.5", body)
         self.assertIn("isEqualToArray", body)
@@ -106,14 +151,16 @@ class PunctSettingsTest(unittest.TestCase):
         body = function_body(self.source, "static void GXKPresentPunctEditor(")
         self.assertIn("UIModalPresentationFullScreen", body)
         self.assertNotIn("pushViewController", body)
-        # 行标题带格数，改完就地刷新。
-        self.assertIn("GXKPunctRowTitle()", body)
+        # 行标题带格数，改完就地刷新（按页取标题，两行各刷各的）。
+        self.assertIn("GXKPunctRowTitle(page)", body)
 
     def test_row_is_recognised_by_key_only(self) -> None:
         ours = function_body(self.source, "static BOOL GXKKeyIsOurs(NSString *key)")
         self.assertIn("GXKPunctRowKey", ours)
         punct = function_body(self.source, "static BOOL GXKIsPunctRowSelected(")
-        self.assertIn("GXKPunctRowKey", punct)
+        # 判定函数按 key 参数比对，两页各传自己的 key；不能靠标题文字。
+        self.assertIn("isEqualToString:rowKey", punct)
+        self.assertIn("GXKPunctDigitRowKey", ours)
         phrases = function_body(self.source, "static BOOL GXKIsPhrasesRowSelected(")
         # 常用语行不能把标点弹层行一起吞掉。
         self.assertIn("[key isEqualToString:GXKPhrasesRowKey]", phrases)
@@ -121,7 +168,7 @@ class PunctSettingsTest(unittest.TestCase):
         inject = function_body(self.source, "static void GXKInjectPhrasesRow(")
         self.assertIn("GXKPunctSettingsRow(", inject)
         self.assertIn("hasPunct", inject)
-        self.assertIn("rows.count + 3", inject)
+        self.assertIn("rows.count + 4", inject)  # 常用语 + 拼音页弹层 + 数字页弹层 + 诊断日志
         pick = function_body(self.source, "static void gxk_settingsPageDidSelect(")
         self.assertIn("GXKIsPunctRowSelected", pick)
         self.assertIn("GXKPresentPunctEditor(", pick)
@@ -129,8 +176,8 @@ class PunctSettingsTest(unittest.TestCase):
     def test_editor_writes_back_on_every_change(self) -> None:
         editor = self.source[self.source.index("@implementation GXKPunctEditorController"):
                               self.source.index("@end", self.source.index("@implementation GXKPunctEditorController"))]
-        self.assertIn("GXKPunctSaveSettings(self.symbols, self.count)", editor)
-        self.assertIn("GXKPunctResetSettings()", editor)
+        self.assertIn("GXKPunctSaveSettings(self.page, self.symbols, self.count)", editor)
+        self.assertIn("GXKPunctResetSettings(self.page)", editor)
         self.assertIn("canEditRowAtIndexPath", editor)
         self.assertIn("GXK_PUNCT_MAX_SYMBOLS", editor)
 
