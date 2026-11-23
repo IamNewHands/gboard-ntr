@@ -1,7 +1,7 @@
 // [FEATURE-punct] 九键空格左侧「，。？」键：长按弹层 + 按住左右滑动选择。
 //
 // 为什么不走原生弹层：
-//   该键绑定的 softkey_9keys_punctuation_candidates 定义里只有 label ",.;:" 与无障碍串，
+//   该键绑定的 softkey_9keys_punctuation_candidates 定义里只有 label ",.;" 与无障碍串，
 //   没有 field3 候选表、也没有 popup_selector，原生 GKBPopupHandler 对这个键根本不建视图。
 //   要让它弹层就得改打包后的 KeyDefinition 二进制，跨版本不可维护，故自绘。
 //
@@ -29,7 +29,7 @@
 
 // 拼音页与 123 数字页底部是同一个 restorationIdentifier（key_pos_9keys_4_1），
 // 但绑定的 softKeyDef 不是同一个：拼音页是 softkey_9keys_comma（这一格显示「，」），
-// 数字页是 softkey_9keys_punctuation_candidates（这一格显示 ASCII ",.;:"）。
+// 数字页是 softkey_9keys_punctuation_candidates（这一格显示 ASCII ",.;"）。
 // 所以按这一格显示的字就能分清是哪一页，不需要去猜 softKeyDef 对象的身份。
 // 两页的符号表与显示个数分开存：改数字页不影响拼音页，反之亦然。
 typedef NS_ENUM(NSInteger, GXKPunctPage) {
@@ -92,7 +92,7 @@ static NSString *GXKPunctCountKey(GXKPunctPage page) {
     return page == GXKPunctPageDigit ? GXK_PUNCT_DIGIT_COUNT_KEY : GXK_PUNCT_COUNT_KEY;
 }
 
-// 数字页默认表：这一格本身印的是 ASCII ",.;:"，所以默认弹 ASCII 标点最不违和；
+// 数字页默认表：这一格本身印的是 ASCII ",.;"，所以默认弹 ASCII 标点最不违和；
 // 拼音页那张中文表在数字页上按出来是一串全角标点，和键帽对不上。
 static NSArray<NSString *> *GXKPunctDigitDefaultSymbols(void) {
     static NSArray<NSString *> *list;
@@ -180,24 +180,61 @@ static NSArray<NSString *> *GXKPunctCandidatesForPage(GXKPunctPage page) {
     return cached[slot];
 }
 
-// 这一格在哪一页：拼音页这一格印「，」（本地化后是单个字符），数字页印 ",.;:"（四个字符）。
+// 这一格的键帽文字：拼音页是「，」（单字），数字页是 ",.;"（简中）或 "，。？"（繁中）。
+// 读不到就返回 nil，调用方各自决定怎么兜底。
+static NSString *GXKPunctKeyLabelText(UIView *key) {
+    if (!key || ![key respondsToSelector:@selector(idToViewDict)]) return nil;
+    NSDictionary *contents = ((id<GXKNativeSoftKeyContent>)key).idToViewDict;
+    if (![contents isKindOfClass:[NSDictionary class]]) return nil;
+    id label = contents[@"label"];
+    if (![label isKindOfClass:[UILabel class]]) return nil;
+    NSString *text = ((UILabel *)label).text;
+    return [text isKindOfClass:[NSString class]] ? text : nil;
+}
+
+// 数字页这一格没有 restorationIdentifier：真机诊断日志（2026-11-23）里数字页 24 个可见软键
+// 只有 8 个带 ident（search_logo / return / emoji / del / left_1..4），key_pos_9keys_4_1
+// 根本不在其中，所以「只按 ident 认」在数字页必然每拍落空，手势从未挂上。
+// 改为按键帽文字认：原包里这一格的 label 字面量是 ",.;"（简中）或 "，。？"（繁中），
+// 全是标点且不止一个字符。判据要求「2~8 个字符，且每个字符都属于 Unicode 标点或符号类」：
+// 数字键 0-9（数字）、空格「空格」、回车「换行」、切换键「123:」（带数字）都不满足；
+// 「按键盘」「符号」这类汉字标签属于字母类（Lo），同样被排除；拼音页那一格只有一个字，长度就不够。
+// 用「必须是标点」而不是「不能是字母数字」：后者会把汉字标签放进来，数字页上不止一格会命中，
+// 命中两格时 find 按布局不确定放弃，长按又会没反应。
+static BOOL GXKPunctLabelIsPunctCandidates(NSString *text) {
+    if (![text isKindOfClass:[NSString class]] || text.length < 2 || text.length > 8) return NO;
+    NSCharacterSet *punct = [NSCharacterSet punctuationCharacterSet];
+    NSCharacterSet *symbol = [NSCharacterSet symbolCharacterSet];
+    for (NSUInteger i = 0; i < text.length; i++) {
+        unichar ch = [text characterAtIndex:i];
+        if (![punct characterIsMember:ch] && ![symbol characterIsMember:ch]) return NO;
+    }
+    return YES;
+}
+
+// 身份判定，全项目唯一一处：有 ident 的键按 ident 认（拼音页 key_pos_9keys_4_1），
+// 没 ident 的键才看键帽文字（数字页）。有 ident 的键绝不拿文字去猜——反过来让文字盖过
+// ident，会把布局里别的带 ident 的键误认成这一格，而数字页的问题正是从「没有 ident」开始的。
+static BOOL GXKPunctKeyMatches(UIView *key) {
+    if (!key) return NO;
+    NSString *ident = key.restorationIdentifier;
+    if (ident.length) return [ident isEqualToString:GXK_PUNCT_KEY_IDENT];
+    return GXKPunctLabelIsPunctCandidates(GXKPunctKeyLabelText(key));
+}
+
+// 这一格在哪一页：拼音页这一格印「，」（本地化后是单个字符），数字页印 ",.;"（三个字符）。
 // 判据只看这一格自己印的字，不去猜 softKeyDef 对象的身份——两页的 ident 完全一样。
 // 不用「首字符是否 ASCII」判断：英文系统下拼音页逗号键也是 ASCII 的 ","，会误判成数字页；
-// 字符数才是两页真正的差别（原包里 punctuation_candidates 的 label 字面量就是 ",.;:"）。
+// 字符数才是两页真正的差别（原包里 punctuation_candidates 的 label 字面量就是 ",.;"）。
 static GXKPunctPage GXKPunctPageForKey(UIView *key) {
     // 读不到字就保持上一次的判定，不猜：猜错会让用户长按数字页弹出中文标点表。
-    if (!key || ![key respondsToSelector:@selector(idToViewDict)]) return gPunctPage;
-    NSDictionary *contents = ((id<GXKNativeSoftKeyContent>)key).idToViewDict;
-    if (![contents isKindOfClass:[NSDictionary class]]) return gPunctPage;
-    id label = contents[@"label"];
-    if (![label isKindOfClass:[UILabel class]]) return gPunctPage;
-    NSString *text = ((UILabel *)label).text;
-    if (![text isKindOfClass:[NSString class]] || text.length == 0) return gPunctPage;
-    // ",.;:" 是四个字符，拼音页那一格永远只有一个字（中文「，」或英文 ","）。
+    NSString *text = GXKPunctKeyLabelText(key);
+    if (text.length == 0) return gPunctPage;
+    // ",.;" 是三个字符，拼音页那一格永远只有一个字（中文「，」或英文 ","）。
     return text.length > 1 ? GXKPunctPageDigit : GXKPunctPagePinyin;
 }
 
-// 只认 key_pos_9keys_4_1 且必须挂在可见九键体上；出现两个可见同 id 就放弃，保持原生不猜。
+// 只认 GXKPunctKeyMatches 命中的那一格，且必须挂在可见九键体上；出现两个可见同款就放弃，保持原生不猜。
 static UIView *GXKPunctFindKey(UIView *root) {
     Class keyClass = GXKClassCached(@"GKBSoftKeyView", &gCachedKeyClass);
     Class nineClass = GXKClassCached(@"GKB9KeysSoftKeyboardView", &gCachedNineKeyClass);
@@ -209,7 +246,10 @@ static UIView *GXKPunctFindKey(UIView *root) {
     // 诊断关闭（出货默认）时不建数组、不 containsObject、不拼字符串：这条路径每次布局都在跑。
     BOOL diag = GXKPunctDiagEnabled();
     NSMutableArray<NSString *> *seenIdents = diag ? [NSMutableArray array] : nil;
-    NSUInteger seenKeys = 0, hiddenSkip = 0, bodyFail = 0, visibleFail = 0, dupes = 0;
+    // [DIAG-punct] 无 ident 的键都印了什么字：数字页那一格若连键帽文字也读不到，
+    // 这条清单会直接显示「那一格没有 label」，不用再猜一轮。
+    NSMutableArray<NSString *> *seenLabels = diag ? [NSMutableArray array] : nil;
+    NSUInteger seenKeys = 0, hiddenSkip = 0, bodyFail = 0, visibleFail = 0, dupes = 0, labelHits = 0;
     while (stack.count && visited++ < 1500) {
         UIView *v = stack.lastObject;
         [stack removeLastObject];
@@ -218,7 +258,14 @@ static UIView *GXKPunctFindKey(UIView *root) {
             seenKeys++;
             NSString *ident = v.restorationIdentifier;
             if (diag && ident.length && ![seenIdents containsObject:ident]) [seenIdents addObject:ident];
-            if ([ident isEqualToString:GXK_PUNCT_KEY_IDENT]) {
+            if (diag && ident.length == 0) {
+                NSString *text = GXKPunctKeyLabelText(v);
+                if (text.length && ![seenLabels containsObject:text]) [seenLabels addObject:text];
+            }
+            // 数字页那一格没有 restorationIdentifier，只按 ident 认必然每拍落空（真机日志：数字页
+            // 24 个可见软键只有 8 个带 ident，key_pos_9keys_4_1 不在其中）。统一走 GXKPunctKeyMatches。
+            if (GXKPunctKeyMatches(v)) {
+                if (diag && ident.length == 0) labelHits++; // [DIAG-punct] 无 ident 靠键帽文字命中
                 BOOL inBody = GXKNineKeyBodyForKey(v, root) != nil;
                 BOOL visible = inBody && GXKKeyIsVisible(v, root);
                 if (!inBody) bodyFail++;
@@ -233,14 +280,19 @@ static UIView *GXKPunctFindKey(UIView *root) {
     }
     if (diag) {
         gDiagFindMiss++;
-        GXKPunctDiagLog(@"find keys=%lu visit=%lu hid=%lu bodyFail=%lu visFail=%lu dup=%lu cand=%d tail=%lu ids=%@",
+        GXKPunctDiagLog(@"find keys=%lu visit=%lu hid=%lu bodyFail=%lu visFail=%lu dup=%lu cand=%d tail=%lu labelHit=%lu ids=%@",
                         (unsigned long)seenKeys, (unsigned long)visited, (unsigned long)hiddenSkip,
                         (unsigned long)bodyFail, (unsigned long)visibleFail, (unsigned long)dupes,
-                        candidate != nil, (unsigned long)stack.count,
+                        candidate != nil, (unsigned long)stack.count, (unsigned long)labelHits,
                         [seenIdents count] > 24
                             ? [NSString stringWithFormat:@"%@…(+%lu)", [seenIdents subarrayWithRange:NSMakeRange(0, 24)],
                                                          (unsigned long)(seenIdents.count - 24)]
                             : [seenIdents componentsJoinedByString:@","]);
+        GXKPunctDiagLog(@"find labels=%@",
+                        [seenLabels count] > 24
+                            ? [NSString stringWithFormat:@"%@…(+%lu)", [seenLabels subarrayWithRange:NSMakeRange(0, 24)],
+                                                         (unsigned long)(seenLabels.count - 24)]
+                            : [seenLabels componentsJoinedByString:@"|"]);
     }
     if (dupes) return nil; // 布局不确定：不动原生
     return stack.count ? nil : candidate;
@@ -476,8 +528,9 @@ static void GXKPunctAttach(UIView *key, UIView *root) {
     // [DIAG-punct] 手势真的挂上了没有：UI 交互开关、已有手势数、可见性、九键体。
     gDiagAttach++;
     CGRect r = [key convertRect:key.bounds toView:root];
-    GXKPunctDiagLog(@"att ident=%@ cls=%@ f=(%.0f,%.0f,%.0f,%.0f) uie=%d ges=%lu inBody=%d vis=%d",
-                    key.restorationIdentifier, NSStringFromClass(key.class),
+    GXKPunctDiagLog(@"att ident=%@ label=%@ cls=%@ f=(%.0f,%.0f,%.0f,%.0f) uie=%d ges=%lu inBody=%d vis=%d",
+                    key.restorationIdentifier ?: @"nil", GXKPunctKeyLabelText(key) ?: @"nil",
+                    NSStringFromClass(key.class),
                     r.origin.x, r.origin.y, r.size.width, r.size.height,
                     (int)key.userInteractionEnabled, (unsigned long)key.gestureRecognizers.count,
                     GXKNineKeyBodyForKey(key, root) != nil, (int)GXKKeyIsVisible(key, root));
@@ -492,7 +545,7 @@ static void GXKPunctPopupUpdate(UIViewController *vc) {
     // 常数级快路径：上一帧的键仍然在同一次布局里、仍然可见、手势还在，就不扫全树。
     UIView *key = gPunctKey;
     if (key && gPunctRoot == root && key.window == root.window && !key.isHidden && key.alpha > 0.05 &&
-        [key.restorationIdentifier isEqualToString:GXK_PUNCT_KEY_IDENT] &&
+        GXKPunctKeyMatches(key) &&
         [key isDescendantOfView:root] && GXKKeyIsVisible(key, root) &&
         objc_getAssociatedObject(key, GXK_PUNCT_ASSOC_KEY)) {
         if (gPunctPanel && gPunctPanel.superview != root) [root addSubview:gPunctPanel];
@@ -513,7 +566,9 @@ static void GXKPunctPopupUpdate(UIViewController *vc) {
     UIView *found = GXKPunctFindKey(root);
     if (!found) {
         // [DIAG-punct] 只记状态变化，避免每帧刷屏。
-        if (gPunctKey) GXKPunctDiagLog(@"det no-key (was %@)", gPunctKey.restorationIdentifier ?: @"nil");
+        if (gPunctKey) GXKPunctDiagLog(@"det no-key (was %@ label=%@)",
+                                      gPunctKey.restorationIdentifier ?: @"nil",
+                                      GXKPunctKeyLabelText(gPunctKey) ?: @"nil");
         GXKPunctDetach();
         return;
     }
@@ -522,7 +577,8 @@ static void GXKPunctPopupUpdate(UIViewController *vc) {
         if (gPunctPanel && gPunctPanel.superview != root) [root addSubview:gPunctPanel];
         return;
     }
-    GXKPunctDiagLog(@"hit new key %@", found.restorationIdentifier ?: @"nil");
+    GXKPunctDiagLog(@"hit new key %@ label=%@", found.restorationIdentifier ?: @"nil",
+                    GXKPunctKeyLabelText(found) ?: @"nil");
     GXKPunctDetach();
     GXKPunctAttach(found, root);
     if (gPunctPanel && gPunctPanel.superview != root) [root addSubview:gPunctPanel];
