@@ -253,7 +253,8 @@ class ActionKeySourceContracts(unittest.TestCase):
         self.assertNotIn("CFAbsoluteTimeGetCurrent", coverage)
         guard = function_body(self.source, "static UIView *GXKGuardedKeyForIcon(")
         self.assertIn("GXKActionDisplayCoversIcon", guard)
-        self.assertIn("gGuardLangKey", guard)
+        # 中英键按「键」守卫（逐键绑定），不再是全局单例 gGuardLangKey。
+        self.assertIn("GXKLangBindingFor(key).prepared", guard)
         self.assertIn("gxk_icon_write_bypass", guard)
         current = function_body(self.display, "static BOOL GXKActionDisplayIsCurrent(")
         self.assertIn("isDescendantOfView:binding.root", current)

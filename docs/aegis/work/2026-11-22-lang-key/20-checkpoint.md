@@ -77,3 +77,13 @@ NSExtensionPrincipalClass = "GKBUIInputViewController"
 5. 判读：`lang src=GKBLanguageID state=1` 应随中英翻转；若出现 `state=-1` 说明反射没命中，
    若出现 `src=mul` 说明退回了宿主判据（即修复未生效）。
    闪圆圈看 `gd emoji`/`gd lang` 是否出现在 `own=0 grace=0` 的 `upd` 之后 —— 那就是漏网的一帧。
+## 第三版：逐键绑定替换全局单例（2026-11-23 13:5x，已落盘/待编译与真机）
+
+- 现象仍未解决：用户装 420e2ee 包后齿轮键仍闪原生图标。旧实现把覆盖按钮挂在 `GXKActionHostForKey(key)`（键的父容器）上，并用全局单例 `gGuardLangKey`/`gLangNativeIcon` 记归属 —— 原生把键 bring 到最前、或整批重建键内容时覆盖层被盖住，只能等 0.2 秒轮询补回，中间那一帧就是原生齿轮。
+- 改动：照抄换行键的逐键 owner 形状，新增 `GXKLangDisplayBinding`（`gboard-ntr/dylib/gkx.m:610-620`），按 key 关联（`objc_setAssociatedObject`，`gkx.m:648`），按钮成为**键自己的子视图**（`gkx.m:1094-1095`：`if (btn.superview != key) [key addSubview:btn];` + `if (key.subviews.lastObject != btn) [key bringSubviewToFront:btn];`）。删除 8 个全局符号与 `GXKLangRebindKey`，只保留 `gLangChinese`（`gkx.m:65`）和 `gUpdatingLangKey`（`gkx.m:880`）。
+- 守卫改按「键」而非 icon 身份：`gkx.m:681` 的 `if (GXKLangBindingFor(key).prepared) return key;` 排在 `gkx.m:682` 的 `GXKNativeIconForKey(key) != icon` 之前 —— 原生换语言会重建 `idToViewDict` 里的 icon 实例，身份比对会漏掉那一帧。
+- 三个生命周期回调（`gxk_key_setSoftKeyDef` `gkx.m:806`、`gxk_key_didMoveToSuperview` `gkx.m:813`、`gxk_key_didMoveToWindow` `gkx.m:820`）调 `GXKReconcileLangDisplay`，原生重画后同一拍把按钮提回最前（`gxk_lang_updateView` 末尾 `gkx.m:838`）。
+- 撤键只还原真正接管过的键：`GXKDetachLangKey` `gkx.m:1030` 的 `if (!binding || !binding.prepared) continue;`，避免对没搬过图的键触发多余重画。
+- 契约测试重写为 17 项（`gboard-ntr/tests/test_lang_key.py`），新增 `test_overlay_is_owned_by_the_key_itself` 锁定「按钮必须是键的子视图且同拍提到最前」，并禁止 `[host addSubview:btn]` 与 `GXKActionHostForKey` 出现在 reconcile 里；`gboard-ntr/tests/test_action_key.py:256` 由 `gGuardLangKey` 改为断言 `GXKLangBindingFor(key).prepared`。
+- 验证：`python -m unittest discover -s tests -p 'test_*.py'` → **190 项 OK**，`git diff --check` 干净。**未编译**（本机无 iOS clang/SDK），**未 commit/push**，**未出新 IPA**。
+- 已知未验：本机无法证明 UIKit 运行时零闪；native fixture 仍有既存 SIGSEGV（CI 里已 `continue-on-error`，与本改动无关），arm64 编译与新包只能走 CI。

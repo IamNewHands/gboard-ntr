@@ -59,17 +59,8 @@ static NSTimer *gStatePollTimer;
 // 按需轮询剩余补帧次数：事件把它抬高，归零后停表，空闲时零唤醒。
 static NSInteger gPollTicks;
 
-// 齿轮键覆盖层：与动作键同一趟遍历里定位，归属、存档、按钮各自独立，互不牵连。
-static __weak UIView *gLangKeyView;
-// 守卫归属：绑定期间指向我们接管的齿轮键；撤键结束即清空，未绑定的键保持原生。
-static __weak UIView *gGuardLangKey;
-static __weak UIView<GXKNativeIconContent> *gLangNativeIcon;
-static UIImage *gLangNormalImage;
-static UIImage *gLangHighlightedImage;
-static id gLangSoftKeyDef;
-static __weak UIView *gLangHost;
-// 纯视觉覆盖按钮：userInteractionEnabled = NO，触摸继续落到底下的原生齿轮键。
-static UIButton *gLangKeyButton;
+// 齿轮键覆盖层：每把中英键一个绑定（GXKLangDisplayBinding，定义见下方守卫段），
+// 存档、按钮、归属都挂在绑定上，不再有跨键共享的单例。这里只留跨键共享的语言判据。
 // 中文态/字体/前景色都没变就不重建富文本：0.2 秒一拍，不重复分配。
 static BOOL gLangChinese;
 
@@ -593,7 +584,9 @@ static BOOL gxk_icon_block_hooked;
 static BOOL gxk_icon_write_bypass;
 static BOOL GXKLangKeyIDMatches(UIView *key);
 static void gxk_lang_updateView(UIView *key);
-static void GXKLangRebindKey(UIView *key);
+static void GXKReconcileLangDisplay(UIView *key);
+static void GXKDetachLangKey(void);
+static void GXKUpdateLangKey(UIViewController *vc);
 
 // Stock GKBImageLayer actionForKey: returns nil. This transaction groups our
 // own writes; it is not evidence of a native implicit fade.
@@ -607,6 +600,56 @@ static void GXKClearIconImages(UIView<GXKNativeIconContent> *icon) {
     if (icon.highlightedImage) icon.highlightedImage = nil;
     [CATransaction commit];
     gxk_icon_write_bypass = bypass;
+}
+
+// ── 中英键显示绑定 ────────────────────────────────────────────────────────
+// 形状照抄换行键的 GXKActionDisplayBinding：每把中英键一个绑定，label 是键**自己**的
+// 子视图。之前的版本把按钮挂在宿主容器（键的父视图）上，只要原生把键 bring 到前面、
+// 或者整批重建键，覆盖层就被盖住/丢失，只能等 0.2 秒轮询补回来 —— 那一段就是原生齿轮。
+// 绑定按 key 关联，所以键实例换了也由新实例自己的生命周期回调立刻认领，不靠全局单例。
+@interface GXKLangDisplayBinding : NSObject
+@property(nonatomic, weak) UIView *key;
+@property(nonatomic, weak) UIView<GXKNativeIconContent> *icon;
+@property(nonatomic, strong) UIButton *button;
+@property(nonatomic, strong) id model;
+@property(nonatomic, strong) UIImage *normalImage;
+@property(nonatomic, strong) UIImage *highlightedImage;
+@property(nonatomic) BOOL prepared;
+@property(nonatomic) BOOL reconciling;
+@end
+@implementation GXKLangDisplayBinding @end
+
+static char GXKLangDisplayAssociation;
+// 仅用于刷新/离场枚举，不是第二个视觉或身份 owner。
+static NSHashTable<UIView *> *gLangDisplayKeys;
+
+static GXKLangDisplayBinding *GXKLangBindingFor(UIView *key) {
+    return key ? objc_getAssociatedObject(key, &GXKLangDisplayAssociation) : nil;
+}
+
+static GXKLangDisplayBinding *GXKLangBindingForKey(UIView *key) {
+    GXKLangDisplayBinding *binding = GXKLangBindingFor(key);
+    if (!binding) {
+        binding = [[GXKLangDisplayBinding alloc] init];
+        binding.key = key;
+        UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
+        btn.backgroundColor = [UIColor clearColor];
+        btn.adjustsImageWhenHighlighted = NO;
+        btn.showsTouchWhenHighlighted = NO;
+        btn.titleLabel.adjustsFontSizeToFitWidth = YES;
+        btn.titleLabel.minimumScaleFactor = 0.6;
+        btn.titleLabel.numberOfLines = 1;
+        btn.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        // 纯视觉覆盖：命中测试直接跳过本按钮，触摸落回原生齿轮键。
+        btn.userInteractionEnabled = NO;
+        btn.accessibilityElementsHidden = YES;
+        btn.isAccessibilityElement = NO;
+        binding.button = btn;
+        objc_setAssociatedObject(key, &GXKLangDisplayAssociation, binding, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if (!gLangDisplayKeys) gLangDisplayKeys = [NSHashTable weakObjectsHashTable];
+        [gLangDisplayKeys addObject:key];
+    }
+    return binding;
 }
 
 #import "native_key_style.h"
@@ -635,7 +678,7 @@ static UIView *GXKGuardedKeyForIcon(UIView *icon) {
         // 中英键按「键」守卫，不按 icon 身份：原生换语言/换主题会整批重建
         // idToViewDict 里的 icon 实例，写入发生时字典可能还没换上它，
         // 身份比对会漏掉这一帧，原生圆图标就落到键上闪一下。
-        if (key == gGuardLangKey && GXKLangKeyIDMatches(key)) return key;
+        if (GXKLangBindingFor(key).prepared) return key;
         if (GXKNativeIconForKey(key) != icon) return nil;
         if (GXKActionDisplayCoversIcon(icon)) return key;
         return nil;
@@ -645,9 +688,10 @@ static UIView *GXKGuardedKeyForIcon(UIView *icon) {
 
 static void GXKArchiveGuardedImage(UIView *key, UIImage *image, BOOL highlighted) {
     GXKRecordActionImage(key, image, highlighted);
-    if (key == gGuardLangKey) {
-        if (highlighted) gLangHighlightedImage = image;
-        else gLangNormalImage = image;
+    GXKLangDisplayBinding *lang = GXKLangBindingFor(key);
+    if (lang) {
+        if (highlighted) lang.highlightedImage = image;
+        else lang.normalImage = image;
     }
 }
 
@@ -759,34 +803,39 @@ static void gxk_key_setSoftKeyDef(id self, SEL _cmd, id model) {
     id previous = [key respondsToSelector:@selector(softKeyDef)] ? ((id<GXKNativeSoftKeyContent>)key).softKeyDef : nil;
     if (previous != model) GXKInvalidateActionDisplay(key);
     if (gOrigKeySetSoftKeyDef) gOrigKeySetSoftKeyDef(self, _cmd, model);
-    GXKLangRebindKey(key); // 模型换了：中英覆盖层立刻就地重绑并提到最上层。
+    GXKReconcileLangDisplay(key); // 模型换了：中英覆盖层立刻就地重绑并提到最上层。
     GXKReconcileActionDisplay(key);
 }
 static void gxk_key_didMoveToSuperview(id self, SEL _cmd) {
     GXKInvalidateActionDisplay((UIView *)self);
     GXKBumpKeyCacheEpoch();
     if (gOrigKeyDidMoveToSuperview) gOrigKeyDidMoveToSuperview(self, _cmd);
-    GXKLangRebindKey((UIView *)self);
+    GXKReconcileLangDisplay((UIView *)self);
     GXKReconcileActionDisplay((UIView *)self);
 }
 static void gxk_key_didMoveToWindow(id self, SEL _cmd) {
     GXKInvalidateActionDisplay((UIView *)self);
     GXKBumpKeyCacheEpoch();
     if (gOrigKeyDidMoveToWindow) gOrigKeyDidMoveToWindow(self, _cmd);
-    GXKLangRebindKey((UIView *)self);
+    GXKReconcileLangDisplay((UIView *)self);
     GXKReconcileActionDisplay((UIView *)self);
 }
 
+// 原生重画之后：只处理「已挂绑定」的键，把刚画上的图搬进存档并清掉。
+// 归属按 key 查，不按全局单例；未绑定的键一律保持原生。
 static void gxk_lang_updateView(UIView *key) {
-    if (key != gGuardLangKey || !GXKLangKeyIDMatches(key)) return;
+    GXKLangDisplayBinding *binding = GXKLangBindingFor(key);
+    if (!binding || !binding.prepared) return;
     UIView<GXKNativeIconContent> *icon = GXKNativeIconForKey(key);
     if (!icon) return;
     if (icon.image || icon.highlightedImage) {
         GXKPunctDiagLog(@"gd lang %@", key.restorationIdentifier);
     }
-    if (icon.image) gLangNormalImage = icon.image;
-    if (icon.highlightedImage) gLangHighlightedImage = icon.highlightedImage;
+    if (icon.image) binding.normalImage = icon.image;
+    if (icon.highlightedImage) binding.highlightedImage = icon.highlightedImage;
     GXKClearIconImages(icon);
+    // 原生重画可能把 icon 视图重新插回键上：同一拍把我们的按钮提回最前。
+    GXKReconcileLangDisplay(key);
 }
 
 static BOOL GXKInstallKeyDisplayMethod(Class cls, SEL sel, IMP imp, void **original, unsigned int arguments) {
@@ -968,32 +1017,35 @@ static NSAttributedString *GXKLangAttributedTitle(BOOL chinese, UIColor *color, 
     return text;
 }
 
+// 撤键：按绑定还原同一身份的原生图，再拆掉我们自己的按钮。
+// 只对「仍挂着绑定」的键动手；键已被原生重建时新实例没有绑定，天然是原生状态。
 static void GXKDetachLangKey(void) {
     GXKClearLangKeyCache(); // 键已撤：定位缓存作废，下次从头认当前布局。
     BOOL wasUpdating = gUpdatingLangKey;
     gUpdatingLangKey = YES;
-    UIView *oldKey = gLangKeyView;
-    UIView<GXKNativeIconContent> *oldIcon = gLangNativeIcon;
-    UIImage *normalImage = gLangNormalImage;
-    UIImage *highlightedImage = gLangHighlightedImage;
-    id oldModel = gLangSoftKeyDef;
-    UIButton *oldButton = gLangKeyButton;
-    gLangKeyView = nil;
-    gLangNativeIcon = nil;
-    gLangNormalImage = nil;
-    gLangHighlightedImage = nil;
-    gLangSoftKeyDef = nil;
-    gLangHost = nil;
-    gLangKeyButton = nil;
-    [oldButton removeFromSuperview];
-    // 归属先释放再调原生 updateView：这次重画是「还原」，守卫不能再把图搬走。
-    gGuardLangKey = nil;
-    if (oldKey && [oldKey respondsToSelector:@selector(updateView)]) {
-        BOOL wasHidden = oldKey.isHidden;
-        [(id<GXKNativeSoftKeyContent>)oldKey updateView];
-        oldKey.hidden = wasHidden;
-        if (GXKLangKeyIDMatches(oldKey) && GXKNativeIconForKey(oldKey) == oldIcon &&
-            ((id<GXKNativeSoftKeyContent>)oldKey).softKeyDef == oldModel) {
+    NSArray<UIView *> *keys = gLangDisplayKeys.allObjects;
+    for (UIView *key in keys) {
+        GXKLangDisplayBinding *binding = GXKLangBindingFor(key);
+        // 只还原真正接管过的键：没 prepared 的绑定没搬过任何图，动它反而会触发多余重画。
+        if (!binding || !binding.prepared) continue;
+        binding.prepared = NO; // 先撤归属，下面这次原生重画是「还原」，守卫不能再把图搬走。
+        UIButton *btn = binding.button;
+        UIView<GXKNativeIconContent> *oldIcon = binding.icon;
+        UIImage *normalImage = binding.normalImage;
+        UIImage *highlightedImage = binding.highlightedImage;
+        id oldModel = binding.model;
+        binding.button = nil;
+        binding.icon = nil;
+        binding.model = nil;
+        binding.normalImage = nil;
+        binding.highlightedImage = nil;
+        [btn removeFromSuperview];
+        if (!key || ![key respondsToSelector:@selector(updateView)]) continue;
+        BOOL wasHidden = key.isHidden;
+        [(id<GXKNativeSoftKeyContent>)key updateView];
+        key.hidden = wasHidden;
+        if (GXKLangKeyIDMatches(key) && GXKNativeIconForKey(key) == oldIcon &&
+            ((id<GXKNativeSoftKeyContent>)key).softKeyDef == oldModel) {
             gxk_icon_write_bypass = YES;
             if (!oldIcon.image && normalImage) oldIcon.image = normalImage;
             if (!oldIcon.highlightedImage && highlightedImage) oldIcon.highlightedImage = highlightedImage;
@@ -1003,151 +1055,98 @@ static void GXKDetachLangKey(void) {
     gUpdatingLangKey = wasUpdating;
 }
 
-// 键生命周期回调里的轻量重绑：只在「这把键就是当前中英键」时跑，不做全树扫描。
-// 原生换语言/换主题/换页会就地改 softKeyDef 甚至换掉 idToViewDict 里的 icon 实例，
-// 覆盖层必须跟着换绑，否则要等到下一拍轮询才补上，中间露出原生圆图标。
-static void GXKLangRebindKey(UIView *key) {
-    if (!key || key != gLangKeyView || gUpdatingLangKey) return;
-    if (!GXKLangKeyIDMatches(key)) return;
-    UIButton *btn = gLangKeyButton;
-    UIView *host = gLangHost;
-    if (!btn) return;
-    if (btn.superview != host) {
-        // 换页会把键搬到新的容器：宿主跟着换，否则覆盖层留在旧容器里不再跟随。
-        UIView *freshHost = GXKActionHostForKey(key);
-        if (!freshHost) return;
-        host = freshHost;
-        gLangHost = freshHost;
-        [freshHost addSubview:btn];
-    }
+// 每把中英键的对位与重绘：label 挂在键自己身上，所以键被原生 bring 到前面、
+// 或者整批重建内容时，覆盖层跟着键走，不需要等下一拍轮询。
+static void GXKReconcileLangDisplay(UIView *key) {
+    GXKLangDisplayBinding *binding = GXKLangBindingFor(key);
+    if (!binding || binding.reconciling) return;
     UIView<GXKNativeIconContent> *icon = GXKNativeIconForKey(key);
-    if (icon) {
-        // 换的是 icon 实例：存档跟着换成新实例的图，守卫与廉价路径才对得上。
-        gLangNativeIcon = icon;
-        gLangSoftKeyDef = ((id<GXKNativeSoftKeyContent>)key).softKeyDef;
-        if (icon.image) gLangNormalImage = icon.image;
-        if (icon.highlightedImage) gLangHighlightedImage = icon.highlightedImage;
-        GXKClearIconImages(icon); // 原生重画立刻搬走，别让它落在键上。
+    id model = icon ? ((id<GXKNativeSoftKeyContent>)key).softKeyDef : nil;
+    UIColor *color = icon ? icon.foregroundColor : nil;
+    // 原生没给前景色（键还没画）时不改外观，等它画完这一拍再说。
+    if (!icon || !model || ![color isKindOfClass:[UIColor class]]) return;
+    binding.reconciling = YES;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    if (binding.icon != icon) {
+        binding.icon = icon;
+        binding.normalImage = nil;
+        binding.highlightedImage = nil;
     }
-    CGRect rect = [key convertRect:key.bounds toView:host];
-    if (!CGRectEqualToRect(btn.frame, rect)) btn.frame = rect;
-    if (host.subviews.lastObject != btn) [host bringSubviewToFront:btn];
-}
-
-static void GXKUpdateLangKey(UIViewController *vc) {
-    if (gUpdatingLangKey || !vc || vc != gCurrentVC || !vc.isViewLoaded) return;
-    gUpdatingLangKey = YES;
-    UIView *root = vc.view;
-    BOOL chinese = GXKLangCurrentIsChinese(vc);
-    gLangChinese = chinese;
-
-    // 廉价路径：绑定仍有效时只搬图、对位、改两字透明度，不做全树定位。
-    if (gLangKeyView && gLangNativeIcon && gLangSoftKeyDef && gLangKeyButton && gLangHost &&
-        gLangKeyButton.superview == gLangHost && GXKLangKeyIDMatches(gLangKeyView) &&
-        GXKActionHostForKey(gLangKeyView) == gLangHost && [gLangKeyView isDescendantOfView:root] &&
-        GXKKeyIsVisible(gLangKeyView, root) && GXKNativeIconForKey(gLangKeyView) == gLangNativeIcon &&
-        ((id<GXKNativeSoftKeyContent>)gLangKeyView).softKeyDef == gLangSoftKeyDef) {
-        UIButton *cheapBtn = gLangKeyButton;
-        UIView<GXKNativeIconContent> *cheapIcon = gLangNativeIcon;
-        if (cheapIcon.image) {
-            gLangNormalImage = cheapIcon.image;
-            cheapIcon.image = nil;
-        }
-        if (cheapIcon.highlightedImage) {
-            gLangHighlightedImage = cheapIcon.highlightedImage;
-            cheapIcon.highlightedImage = nil;
-        }
-        CGRect cheapRect = [gLangKeyView convertRect:gLangKeyView.bounds toView:gLangHost];
-        if (!CGRectEqualToRect(cheapBtn.frame, cheapRect)) cheapBtn.frame = cheapRect;
-        if (gLangHost.subviews.lastObject != cheapBtn) [gLangHost bringSubviewToFront:cheapBtn];
-        UIColor *cheapColor = cheapIcon.foregroundColor;
-        if (![cheapColor isKindOfClass:[UIColor class]]) cheapColor = cheapBtn.currentTitleColor;
-        UIFont *cheapFont = GXKNativeKeyFont(GXKNineKeyBodyForKey(gLangKeyView, root) ?: gLangKeyView, root);
-        NSAttributedString *cheapTitle = GXKLangAttributedTitle(chinese, cheapColor, cheapFont);
-        if (![[cheapBtn attributedTitleForState:UIControlStateNormal] isEqualToAttributedString:cheapTitle]) {
-            [cheapBtn setAttributedTitle:cheapTitle forState:UIControlStateNormal];
-            cheapBtn.accessibilityLabel = chinese ? @"中/英，当前中文" : @"中/英，当前英文";
-        }
-        gUpdatingLangKey = NO;
-        return;
-    }
-
-    UIView *currentKey = GXKFindLangKey(root);
-    UIView<GXKNativeIconContent> *icon = GXKNativeIconForKey(currentKey);
-    id model = icon ? ((id<GXKNativeSoftKeyContent>)currentKey).softKeyDef : nil;
-    if (!currentKey || !icon || ![icon.foregroundColor isKindOfClass:[UIColor class]]) {
-        GXKDetachLangKey(); // 只装一种语言、26 键无齿轮键等情形一律保持原生。
-        gUpdatingLangKey = NO;
-        return;
-    }
-    UIView *host = GXKActionHostForKey(currentKey);
-    if (!host) {
-        GXKDetachLangKey();
-        gUpdatingLangKey = NO;
-        return;
-    }
-    if (gLangKeyView != currentKey || gLangNativeIcon != icon || gLangSoftKeyDef != model ||
-        !gLangKeyButton || gLangKeyButton.superview != host) {
-        GXKDetachLangKey();
-        if (vc != gCurrentVC || !vc.isViewLoaded || vc.view != root) {
-            gUpdatingLangKey = NO;
-            return;
-        }
-        currentKey = GXKFindLangKey(root);
-        icon = GXKNativeIconForKey(currentKey);
-        model = icon ? ((id<GXKNativeSoftKeyContent>)currentKey).softKeyDef : nil;
-        // 同上：守卫会在写入点拦截，前景为空是正常状态，不能因此拒绝绑定。
-        if (!currentKey || !icon || ![icon.foregroundColor isKindOfClass:[UIColor class]]) {
-            gUpdatingLangKey = NO;
-            return;
-        }
-        host = GXKActionHostForKey(currentKey);
-        if (!host) {
-            gUpdatingLangKey = NO;
-            return;
-        }
-        UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
+    binding.model = model;
+    UIButton *btn = binding.button;
+    if (!btn) {
+        btn = [UIButton buttonWithType:UIButtonTypeCustom];
         btn.backgroundColor = [UIColor clearColor];
         btn.adjustsImageWhenHighlighted = NO;
         btn.showsTouchWhenHighlighted = NO;
         btn.titleLabel.adjustsFontSizeToFitWidth = YES;
         btn.titleLabel.minimumScaleFactor = 0.6;
         btn.titleLabel.numberOfLines = 1;
-        btn.autoresizingMask = UIViewAutoresizingNone;
+        btn.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         // 纯视觉覆盖：命中测试直接跳过本按钮，触摸落回原生齿轮键。
         btn.userInteractionEnabled = NO;
         btn.accessibilityElementsHidden = YES;
-        gLangKeyView = currentKey;
-        gGuardLangKey = currentKey;
-        gLangNativeIcon = icon;
-        gLangSoftKeyDef = model;
-        gLangHost = host;
-        gLangKeyButton = btn;
-        [host addSubview:btn];
-        btn.frame = [currentKey convertRect:currentKey.bounds toView:host];
+        btn.isAccessibilityElement = NO;
+        binding.button = btn;
     }
-
-    if (icon.image) {
-        gLangNormalImage = icon.image;
-        icon.image = nil;
-    }
-    if (icon.highlightedImage) {
-        gLangHighlightedImage = icon.highlightedImage;
-        icon.highlightedImage = nil;
-    }
-    UIButton *btn = gLangKeyButton;
-    gLangHost = host;
-    if (btn.superview != host) [host addSubview:btn];
-    CGRect targetRect = [currentKey convertRect:currentKey.bounds toView:host];
-    if (!CGRectEqualToRect(btn.frame, targetRect)) btn.frame = targetRect;
-    if (host.subviews.lastObject != btn) [host bringSubviewToFront:btn];
-    UIColor *color = icon.foregroundColor;
-    UIFont *font = GXKNativeKeyFont(GXKNineKeyBodyForKey(currentKey, root) ?: currentKey, root);
-    NSAttributedString *title = GXKLangAttributedTitle(chinese, color, font);
+    if (!CGRectEqualToRect(btn.frame, key.bounds)) btn.frame = key.bounds;
+    // 挂到键自己身上：这是与换行键同一条归属规则，也是原生 bring-to-front 盖不住它的原因。
+    if (btn.superview != key) [key addSubview:btn];
+    if (key.subviews.lastObject != btn) [key bringSubviewToFront:btn];
+    UIView *root = gCurrentVC.isViewLoaded ? gCurrentVC.view : nil;
+    UIFont *font = GXKNativeKeyFont(GXKNineKeyBodyForKey(key, root) ?: key, root);
+    NSAttributedString *title = GXKLangAttributedTitle(gLangChinese, color, font);
     if (![[btn attributedTitleForState:UIControlStateNormal] isEqualToAttributedString:title]) {
         [btn setAttributedTitle:title forState:UIControlStateNormal];
-        btn.accessibilityLabel = chinese ? @"中/英，当前中文" : @"中/英，当前英文";
     }
+    NSString *label = gLangChinese ? @"中/英，当前中文" : @"中/英，当前英文";
+    if (![btn.accessibilityLabel isEqualToString:label]) btn.accessibilityLabel = label;
+    // 与换行键同一条顺序：先认领，再存档，最后无条件清。
+    // 我们自己清出来的 nil 不算原生 nil 更新（GXKClearIconImages 内部置 bypass）。
+    binding.prepared = YES;
+    if (icon.image) binding.normalImage = icon.image;
+    if (icon.highlightedImage) binding.highlightedImage = icon.highlightedImage;
+    GXKClearIconImages(icon);
+    [CATransaction commit];
+    binding.reconciling = NO;
+}
+
+static void GXKUpdateLangKey(UIViewController *vc) {
+    if (gUpdatingLangKey || !vc || vc != gCurrentVC || !vc.isViewLoaded) return;
+    gUpdatingLangKey = YES;
+    UIView *root = vc.view;
+    gLangChinese = GXKLangCurrentIsChinese(vc);
+
+    // 廉价路径：绑定仍有效时只搬图、对位、改两字透明度，不做全树定位。
+    UIView *currentKey = GXKFindLangKey(root);
+    if (currentKey) {
+        GXKLangDisplayBinding *binding = GXKLangBindingForKey(currentKey);
+        if (binding.prepared) {
+            GXKReconcileLangDisplay(currentKey);
+            gUpdatingLangKey = NO;
+            return;
+        }
+    }
+    if (!currentKey) {
+        GXKDetachLangKey(); // 只装一种语言、26 键无齿轮键等情形一律保持原生。
+        gUpdatingLangKey = NO;
+        return;
+    }
+    // 绑定还挂在别的键上（切页/换布局）：先撤旧的，再按当前键重建。
+    NSArray<UIView *> *stale = gLangDisplayKeys.allObjects;
+    for (UIView *key in stale) {
+        if (key != currentKey && GXKLangBindingFor(key)) {
+            GXKDetachLangKey();
+            break;
+        }
+    }
+    if (vc != gCurrentVC || !vc.isViewLoaded || vc.view != root) {
+        gUpdatingLangKey = NO;
+        return;
+    }
+    GXKLangBindingForKey(currentKey);
+    GXKReconcileLangDisplay(currentKey);
     gUpdatingLangKey = NO;
 }
 
