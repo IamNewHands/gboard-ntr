@@ -775,16 +775,20 @@ static void gxk_key_setSoftKeyDef(id self, SEL _cmd, id model) {
     GXKDebugHookExit();
 }
 static void gxk_key_didMoveToSuperview(id self, SEL _cmd) {
+    GXKDebugHook("didMoveToSuperview", (UIView *)self);
     GXKInvalidateActionDisplay((UIView *)self);
     GXKBumpKeyCacheEpoch();
     if (gOrigKeyDidMoveToSuperview) gOrigKeyDidMoveToSuperview(self, _cmd);
     GXKReconcileActionDisplay((UIView *)self);
+    GXKDebugHookExit();
 }
 static void gxk_key_didMoveToWindow(id self, SEL _cmd) {
+    GXKDebugHook("didMoveToWindow", (UIView *)self);
     GXKInvalidateActionDisplay((UIView *)self);
     GXKBumpKeyCacheEpoch();
     if (gOrigKeyDidMoveToWindow) gOrigKeyDidMoveToWindow(self, _cmd);
     GXKReconcileActionDisplay((UIView *)self);
+    GXKDebugHookExit();
 }
 
 static void gxk_lang_updateView(UIView *key) {

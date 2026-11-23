@@ -182,12 +182,17 @@ static void GXKDebugDepthPhase(const char *phase, UIView *view) {
     self.idToViewDict = @{};
 }
 - (void)buildNativeContents {
+    GXKDebugNativePhase("build: before content alloc");
     UIView *content = [[UIView alloc] initWithFrame:self.hostView.bounds];
     content.userInteractionEnabled = NO;
+    GXKDebugNativePhase("build: after content alloc");
     GKBImageViewWithBackground *icon = [[GKBImageViewWithBackground alloc] initWithFrame:content.bounds];
     icon.restorationIdentifier = @"image";
+    GXKDebugNativePhase("build: after icon alloc");
     [content addSubview:icon];
+    GXKDebugNativePhase("build: after content addSubview icon");
     [self.hostView addSubview:content]; // Native content must be first, before GXK's label.
+    GXKDebugNativePhase("build: after host addSubview content");
     NSMutableDictionary *contents = [@{@"image": icon} mutableCopy];
     if ([self.restorationIdentifier isEqualToString:@"key_pos_9keys_return"]) {
         UILabel *label = [[UILabel alloc] initWithFrame:content.bounds];
@@ -346,11 +351,20 @@ static NSUInteger GXKFixtureBluePixels(NSData *data) {
 - (void)setUp {
     [super setUp];
     XCTAssertTrue(NSThread.isMainThread, @"UIKit fixture must execute on the main thread.");
-    GXKDebugNativePhase("before pre-hook key probe");
+    // Bisect 1: identical fixture construction with NO dylib hooks installed.
+    // Surviving here means the dylib hook path owns the crash.
+    GXKDebugNativePhase("pre-hook probe: before alloc");
     GKBSoftKeyView *probeKey = [GKBSoftKeyView alloc];
-    GXKDebugNativePhase("after pre-hook key alloc");
-    probeKey = [probeKey initWithFrame:CGRectMake(0, 0, 10, 10)];
-    GXKDebugNativePhase("after pre-hook key probe");
+    GXKDebugNativePhase("pre-hook probe: after alloc");
+    probeKey = [probeKey initWithFrame:CGRectMake(0, 0, 48, 44)];
+    GXKDebugNativePhase("pre-hook probe: after init");
+    probeKey.restorationIdentifier = @"key_pos_9keys_return";
+    GXKFixtureSoftKeyDef *probeModel = [[GXKFixtureSoftKeyDef alloc] init];
+    probeModel.actionsArray = @[@"native-action"];
+    probeModel.layout = @"pre-hook-probe";
+    GXKDebugNativePhase("pre-hook probe: before model assignment");
+    probeKey.softKeyDef = probeModel;
+    GXKDebugNativePhase("pre-hook probe: after model assignment");
     probeKey = nil;
     GXKDebugNativePhase("before hook installation");
     GXKInstallIconWriteGuard(); // Install the actual production native/key/layer hooks.
@@ -379,22 +393,6 @@ static NSUInteger GXKFixtureBluePixels(NSData *data) {
     gCurrentVC = self.controller;
     self.body = [[GKB9KeysSoftKeyboardView alloc] initWithFrame:CGRectMake(0, 120, 390, 260)];
     [self.controller.view addSubview:self.body];
-    // Bisect: same fixture construction with the dylib icon guards bypassed.
-    // Surviving here means the guarded write path, not UIKit, owns the crash.
-    GXKDebugNativePhase("hookless probe: before");
-    {
-        BOOL bypass = gxk_icon_write_bypass;
-        gxk_icon_write_bypass = YES;
-        GKBSoftKeyView *probe = [[GKBSoftKeyView alloc] initWithFrame:CGRectMake(0, 0, 48, 44)];
-        probe.restorationIdentifier = @"key_pos_9keys_return";
-        GXKFixtureSoftKeyDef *probeModel = [self modelWithActions:@[] layout:@"hookless-probe"];
-        GXKDebugNativePhase("hookless probe: before model assignment");
-        probe.softKeyDef = probeModel;
-        GXKDebugNativePhase("hookless probe: after model assignment");
-        probe = nil;
-        gxk_icon_write_bypass = bypass;
-    }
-    GXKDebugNativePhase("hookless probe: after");
     GXKDebugNativePhase("before native return key construction");
     self.returnKey = [self makeKey:@"key_pos_9keys_return" separateHost:NO attach:NO];
     GXKDebugNativePhase("after native return key construction");
