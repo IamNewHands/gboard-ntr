@@ -25,13 +25,11 @@ jobs:
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-version
 
-      # Known gap: the new UIKit fixture crashes with SIGSEGV inside
-      # -[GKBSoftKeyView buildNativeContents] on [content addSubview:icon].
-      # The crash is in test-only fixture code; libgkx.dylib is unaffected.
-      # Keep the step visible but non-blocking until the fixture is fixed, so
-      # the dylib and IPA pipeline is not held hostage by it.
+      # The fixture used to SIGSEGV on [content addSubview:icon] because the icon
+      # view was the delegate of its two non-backing image layers, which made
+      # UIKit's subtree walk cycle. Fixed in 309af34, so this step is blocking
+      # again: a red run here means the action display really regressed.
       - name: Test production action display with UIKit (Simulator)
-        continue-on-error: true
         timeout-minutes: 15
         run: bash tests/native/run_tests.sh
 
