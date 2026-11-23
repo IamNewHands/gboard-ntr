@@ -5,6 +5,13 @@
 #import <XCTest/XCTest.h>
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
+#import <stdio.h>
+
+// Temporary CI-only boundary probe. Remove after the shared SIGSEGV is located.
+static void GXKDebugNativePhase(const char *phase) {
+    fprintf(stderr, "[DEBUG-native-ci] %s\n", phase);
+    fflush(stderr);
+}
 
 @interface GKBImageLayer : CALayer {
     UIImage *_fixtureImage;
@@ -299,7 +306,9 @@ static NSUInteger GXKFixtureBluePixels(NSData *data) {
 - (void)setUp {
     [super setUp];
     XCTAssertTrue(NSThread.isMainThread, @"UIKit fixture must execute on the main thread.");
+    GXKDebugNativePhase("before hook installation");
     GXKInstallIconWriteGuard(); // Install the actual production native/key/layer hooks.
+    GXKDebugNativePhase("after hook installation");
     gCurrentVC = nil;
     GXKDetachActionKey();
     GXKStopPolling();
@@ -308,19 +317,28 @@ static NSUInteger GXKFixtureBluePixels(NSData *data) {
     gComposingActive = NO;
     gSuggestingActive = NO;
     gComposingScanAt = 0;
+    GXKDebugNativePhase("before fixture images");
     self.normalImage = GXKFixtureImage(UIColor.blueColor);
     self.highlightedImage = GXKFixtureImage(UIColor.orangeColor);
+    GXKDebugNativePhase("before controller initialization");
     self.controller = [[GXKFixtureKeyboardController alloc] init];
+    GXKDebugNativePhase("after controller initialization");
     self.controller.fixtureProxy = [[GXKFixtureProxy alloc] init];
     self.fixtureWindow = [[UIWindow alloc] initWithFrame:CGRectMake(0, 0, 390, 844)];
+    GXKDebugNativePhase("before root controller assignment");
     self.fixtureWindow.rootViewController = self.controller;
+    GXKDebugNativePhase("after root controller assignment / before window display");
     [self.fixtureWindow makeKeyAndVisible];
+    GXKDebugNativePhase("after window display");
     gCurrentVC = self.controller;
     self.body = [[GKB9KeysSoftKeyboardView alloc] initWithFrame:CGRectMake(0, 120, 390, 260)];
     [self.controller.view addSubview:self.body];
+    GXKDebugNativePhase("before native return key construction");
     self.returnKey = [self makeKey:@"key_pos_9keys_return" separateHost:NO attach:NO];
+    GXKDebugNativePhase("after native return key construction");
     self.returnKey.frame = CGRectMake(330, 200, 48, 44);
     [self.body addSubview:self.returnKey];
+    GXKDebugNativePhase("after native return key attachment / setup complete");
 }
 - (void)tearDown {
     gCurrentVC = nil;
