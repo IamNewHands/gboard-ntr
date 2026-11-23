@@ -16,7 +16,7 @@
 #ifndef GXK_PUNCT_POPUP_H
 #define GXK_PUNCT_POPUP_H
 
-#define GXK_PUNCT_KEY_IDENT    @"key_pos_9keys_4_1"
+#define GXK_PUNCT_KEY_IDENT    @"key_pos_9keys_4_1" // 只有拼音页有这个 ident；数字页靠键帽文字认
 #define GXK_PUNCT_HOLD_DELAY   0.32   // 长按判定阈值：低于原生 0.5s，手感更跟手
 #define GXK_PUNCT_CELL_MAX     44.0   // 单格最大宽度，超出则整排按可用宽度均分
 #define GXK_PUNCT_PANEL_HEIGHT 42.0
@@ -27,10 +27,11 @@
 #define GXK_PUNCT_DIGIT_COUNT_KEY   @"GXKPunctDigitCount"   // App Group：数字页显示前几个
 #define GXK_PUNCT_MAX_SYMBOLS  10                 // 上限沿用原版 10 格：375pt 宽键盘单格仍有 37pt
 
-// 拼音页与 123 数字页底部是同一个 restorationIdentifier（key_pos_9keys_4_1），
-// 但绑定的 softKeyDef 不是同一个：拼音页是 softkey_9keys_comma（这一格显示「，」），
-// 数字页是 softkey_9keys_punctuation_candidates（这一格显示 ASCII ",.;"）。
-// 所以按这一格显示的字就能分清是哪一页，不需要去猜 softKeyDef 对象的身份。
+// 拼音页这一格的 restorationIdentifier 是 key_pos_9keys_4_1，123 数字页那一格**没有** ident
+// （真机核对：数字页 24 个可见软键只有 8 个带 ident，4_1 不在其中）。两页绑的 softKeyDef 也不同：
+// 拼音页是 softkey_9keys_comma（显示「，」），数字页是 softkey_9keys_punctuation_candidates（显示 ",.;"）。
+// 所以身份判定分两路：有 ident 按 ident 认，没 ident 按键帽文字认（见 GXKPunctKeyMatches）。
+// 分页同样看这一格显示的字：单字是拼音页，多字是数字页。
 // 两页的符号表与显示个数分开存：改数字页不影响拼音页，反之亦然。
 typedef NS_ENUM(NSInteger, GXKPunctPage) {
     GXKPunctPagePinyin = 0,
@@ -180,16 +181,99 @@ static NSArray<NSString *> *GXKPunctCandidatesForPage(GXKPunctPage page) {
     return cached[slot];
 }
 
+// 单字符是否属于 Unicode 标点/符号类。数字、字母（含汉字 Lo）、空白都不算。
+static BOOL GXKPunctCharIsPunct(unichar ch) {
+    return [[NSCharacterSet punctuationCharacterSet] characterIsMember:ch] ||
+           [[NSCharacterSet symbolCharacterSet] characterIsMember:ch];
+}
+
+static BOOL GXKPunctLabelIsPunctCandidates(NSString *text); // 定义在下方
+
+// 从一个视图上取它自己承载的文字。数字页那一格的 ",.;" 不在 idToViewDict[@"label"] 上，
+// 而是挂在带 caption 的图片视图里（全包只有 GKBImageViewWithCaption / GKBMinimizedLabelWithBackgroundImage /
+// GKBSpaceSoftKeyView 三类有 captionLabel），所以这一层必须认 caption 与 -text，不能只认 UILabel。
+static NSString *GXKPunctTextOfView(id view) {
+    if (!view) return nil;
+    if ([view isKindOfClass:[UILabel class]]) {
+        UILabel *label = (UILabel *)view;
+        if (label.text.length) return label.text;
+        if (label.attributedText.length) return label.attributedText.string;
+        return nil;
+    }
+    @try {
+        if ([view respondsToSelector:@selector(captionLabel)]) {
+            id captionView = [view valueForKey:@"captionLabel"];
+            if (captionView && captionView != view) { // 自引用时不再递归，避免死循环
+                NSString *caption = GXKPunctTextOfView(captionView);
+                if (caption.length) return caption;
+            }
+        }
+        if ([view respondsToSelector:@selector(text)]) {
+            id text = [view valueForKey:@"text"];
+            if ([text isKindOfClass:[NSString class]] && ((NSString *)text).length) return (NSString *)text;
+        }
+        if ([view respondsToSelector:@selector(attributedText)]) {
+            id attributed = [view valueForKey:@"attributedText"];
+            if ([attributed isKindOfClass:[NSAttributedString class]] &&
+                ((NSAttributedString *)attributed).length) {
+                return ((NSAttributedString *)attributed).string;
+            }
+        }
+    } @catch (__unused NSException *e) {}
+    return nil;
+}
+
+// 键帽文字可能挂在任意深度的子视图上（数字页就是），收集有限几段交给下面挑。
+static void GXKPunctCollectTexts(UIView *view, NSUInteger depth, NSMutableArray<NSString *> *out) {
+    if (!view || depth > 3 || out.count >= 8) return;
+    NSString *own = GXKPunctTextOfView(view);
+    if (own.length && ![out containsObject:own]) [out addObject:own];
+    if (out.count >= 8) return;
+    for (UIView *sub in view.subviews) GXKPunctCollectTexts(sub, depth + 1, out);
+}
+
 // 这一格的键帽文字：拼音页是「，」（单字），数字页是 ",.;"（简中）或 "，。？"（繁中）。
 // 读不到就返回 nil，调用方各自决定怎么兜底。
 static NSString *GXKPunctKeyLabelText(UIView *key) {
-    if (!key || ![key respondsToSelector:@selector(idToViewDict)]) return nil;
-    NSDictionary *contents = ((id<GXKNativeSoftKeyContent>)key).idToViewDict;
-    if (![contents isKindOfClass:[NSDictionary class]]) return nil;
-    id label = contents[@"label"];
-    if (![label isKindOfClass:[UILabel class]]) return nil;
-    NSString *text = ((UILabel *)label).text;
-    return [text isKindOfClass:[NSString class]] ? text : nil;
+    if (!key) return nil;
+    // 第一路：原生内容字典。拼音页这一格走这条；数字页这一格字典里没有可用的 label。
+    if ([key respondsToSelector:@selector(idToViewDict)]) {
+        NSDictionary *contents = ((id<GXKNativeSoftKeyContent>)key).idToViewDict;
+        if ([contents isKindOfClass:[NSDictionary class]]) {
+            NSString *text = GXKPunctTextOfView(contents[@"label"]);
+            if (text.length) return text;
+        }
+    }
+    // 第二路：键自己的子视图。优先取「整段都是标点」的那一段：同一个键上可能还挂着图标说明之类的短文字。
+    NSMutableArray<NSString *> *texts = [NSMutableArray arrayWithCapacity:4];
+    GXKPunctCollectTexts(key, 0, texts);
+    for (NSString *text in texts) {
+        if (GXKPunctLabelIsPunctCandidates(text)) return text;
+    }
+    // 第三路：",.;" 也可能被拆成三个单字标签。按子视图顺序拼起来再看一次，
+    // 只在「每一段都是单字符标点」时拼，避免把无关短文字粘成一串假标点。
+    if (texts.count >= 2) {
+        NSMutableString *joined = [NSMutableString string];
+        BOOL allSinglePunct = YES;
+        for (NSString *text in texts) {
+            if (text.length != 1 || !GXKPunctCharIsPunct([text characterAtIndex:0])) {
+                allSinglePunct = NO;
+                break;
+            }
+            [joined appendString:text];
+            if (joined.length > 8) { allSinglePunct = NO; break; }
+        }
+        if (allSinglePunct) return joined;
+    }
+    // 第四路：无障碍串。原包里这一格的 softKeyDef 带一条无障碍文字，键帽若整个用图绘制，
+    // 这是唯一还留着「这一格是什么」的地方。它是给人读的，可能是「标点」这类词，所以只作兜底。
+    @try {
+        if ([key respondsToSelector:@selector(accessibilityLabel)]) {
+            id acc = [key valueForKey:@"accessibilityLabel"];
+            if ([acc isKindOfClass:[NSString class]] && ((NSString *)acc).length) return (NSString *)acc;
+        }
+    } @catch (__unused NSException *e) {}
+    return (NSString *)texts.firstObject;
 }
 
 // 数字页这一格没有 restorationIdentifier：真机诊断日志（2026-11-23）里数字页 24 个可见软键
@@ -203,34 +287,67 @@ static NSString *GXKPunctKeyLabelText(UIView *key) {
 // 命中两格时 find 按布局不确定放弃，长按又会没反应。
 static BOOL GXKPunctLabelIsPunctCandidates(NSString *text) {
     if (![text isKindOfClass:[NSString class]] || text.length < 2 || text.length > 8) return NO;
-    NSCharacterSet *punct = [NSCharacterSet punctuationCharacterSet];
-    NSCharacterSet *symbol = [NSCharacterSet symbolCharacterSet];
     for (NSUInteger i = 0; i < text.length; i++) {
-        unichar ch = [text characterAtIndex:i];
-        if (![punct characterIsMember:ch] && ![symbol characterIsMember:ch]) return NO;
+        if (!GXKPunctCharIsPunct([text characterAtIndex:i])) return NO;
     }
     return YES;
 }
 
+// 这一格绑定的 softKeyDef 是不是标点候选那一个：数字页的键帽若整个用图绘制、
+// 连 caption 都读不到，只剩这条线索能证明「就是这一格」。字符串来自原包布局表里的定义名
+// softkey_9keys_punctuation_candidates，全包没有第二个键用它，不会误伤。
+// 结果按键缓存：-description 会拼字符串，而这条判定在「还没认出这一格」时每拍都在跑，
+// 不缓存就是每帧几十次字符串分配（键盘扩展内存与卡顿红线）。
+// 缓存必须连着 def 对象一起存：键体视图会被原生复用，切页后同一个视图可能已经绑了另一个
+// softKeyDef（数字键「5」复用了上一页标点格的视图）。只存布尔值就会把上一页的结论套到新页。
+// 存成 {def 指针, 结论}，指针一变就重算。
+static char GXKPunctDefCacheKey;
+static BOOL GXKPunctKeyDefIsPunctuation(UIView *key) {
+    if (!key) return NO;
+    if (![key respondsToSelector:@selector(softKeyDef)]) return NO;
+    id def = nil;
+    @try { def = [key valueForKey:@"softKeyDef"]; } @catch (__unused NSException *e) { def = nil; }
+    if (!def) return NO;
+    NSArray *cached = objc_getAssociatedObject(key, &GXKPunctDefCacheKey);
+    if ([cached isKindOfClass:[NSArray class]] && cached.count == 2 && cached[0] == def) {
+        return [cached[1] boolValue];
+    }
+    BOOL hit = NO;
+    @try {
+        NSString *desc = [def description];
+        if ([desc isKindOfClass:[NSString class]] &&
+            [desc rangeOfString:@"punctuation"].location != NSNotFound) {
+            hit = YES;
+        }
+    } @catch (__unused NSException *e) {}
+    objc_setAssociatedObject(key, &GXKPunctDefCacheKey, @[def, @(hit)], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return hit;
+}
+
 // 身份判定，全项目唯一一处：有 ident 的键按 ident 认（拼音页 key_pos_9keys_4_1），
-// 没 ident 的键才看键帽文字（数字页）。有 ident 的键绝不拿文字去猜——反过来让文字盖过
-// ident，会把布局里别的带 ident 的键误认成这一格，而数字页的问题正是从「没有 ident」开始的。
+// 没 ident 的键才看键帽文字或 softKeyDef（数字页）。有 ident 的键绝不拿文字去猜——反过来让
+// 文字盖过 ident，会把布局里别的带 ident 的键误认成这一格，而数字页的问题正是从「没有 ident」开始的。
 static BOOL GXKPunctKeyMatches(UIView *key) {
     if (!key) return NO;
     NSString *ident = key.restorationIdentifier;
     if (ident.length) return [ident isEqualToString:GXK_PUNCT_KEY_IDENT];
-    return GXKPunctLabelIsPunctCandidates(GXKPunctKeyLabelText(key));
+    // 先看键帽文字（最便宜、也最贴近用户看到的东西），读不出来才去问 softKeyDef。
+    if (GXKPunctLabelIsPunctCandidates(GXKPunctKeyLabelText(key))) return YES;
+    return GXKPunctKeyDefIsPunctuation(key);
 }
 
-// 这一格在哪一页：拼音页这一格印「，」（本地化后是单个字符），数字页印 ",.;"（三个字符）。
-// 判据只看这一格自己印的字，不去猜 softKeyDef 对象的身份——两页的 ident 完全一样。
-// 不用「首字符是否 ASCII」判断：英文系统下拼音页逗号键也是 ASCII 的 ","，会误判成数字页；
-// 字符数才是两页真正的差别（原包里 punctuation_candidates 的 label 字面量就是 ",.;"）。
+// 这一格在哪一页。第一判据是 ident：key_pos_9keys_4_1 只有拼音页有，数字页那一格没有 ident，
+// 所以「有 ident 就是拼音页」是最稳的一条，不依赖能否读到字。
+// 没有 ident 时退到键帽文字：数字页印 ",.;"（三个字符），拼音页永远只有一个字。
+// 不用「首字符是否 ASCII」判断：英文系统下拼音页逗号键也是 ASCII 的 ","，会误判成数字页。
 static GXKPunctPage GXKPunctPageForKey(UIView *key) {
-    // 读不到字就保持上一次的判定，不猜：猜错会让用户长按数字页弹出中文标点表。
+    if (!key) return gPunctPage;
+    if (key.restorationIdentifier.length) return GXKPunctPagePinyin;
+    // 没有 ident 就是数字页那一格：布局表里数字页的标点格不写 restorationIdentifier。
+    // 不按文字长短判，是因为键帽文字可能整个读不出来；ident 的有无本来就是两页的硬差别。
+    if (GXKPunctKeyDefIsPunctuation(key)) return GXKPunctPageDigit;
     NSString *text = GXKPunctKeyLabelText(key);
     if (text.length == 0) return gPunctPage;
-    // ",.;" 是三个字符，拼音页那一格永远只有一个字（中文「，」或英文 ","）。
     return text.length > 1 ? GXKPunctPageDigit : GXKPunctPagePinyin;
 }
 
@@ -259,8 +376,13 @@ static UIView *GXKPunctFindKey(UIView *root) {
             NSString *ident = v.restorationIdentifier;
             if (diag && ident.length && ![seenIdents containsObject:ident]) [seenIdents addObject:ident];
             if (diag && ident.length == 0) {
-                NSString *text = GXKPunctKeyLabelText(v);
-                if (text.length && ![seenLabels containsObject:text]) [seenLabels addObject:text];
+                // 打「原始收集结果」而不是最终判定：判定为空时才能看出到底是没文字，
+                // 还是有文字但被标点判据否掉（例如拆成单字、或带了数字）。
+                NSMutableArray<NSString *> *raw = [NSMutableArray arrayWithCapacity:4];
+                GXKPunctCollectTexts(v, 0, raw);
+                NSString *entry = raw.count ? [raw componentsJoinedByString:@"/"] : @"<no-text>";
+                if (GXKPunctKeyDefIsPunctuation(v)) entry = [entry stringByAppendingString:@" [def:punct]"];
+                if (![seenLabels containsObject:entry]) [seenLabels addObject:entry];
             }
             // 数字页那一格没有 restorationIdentifier，只按 ident 认必然每拍落空（真机日志：数字页
             // 24 个可见软键只有 8 个带 ident，key_pos_9keys_4_1 不在其中）。统一走 GXKPunctKeyMatches。
