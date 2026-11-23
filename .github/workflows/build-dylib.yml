@@ -139,11 +139,22 @@ jobs:
           gh release download v1.0 --repo "${GITHUB_REPOSITORY}" \
             --pattern gboard-ntr-1.0-unsigned.ipa --dir base
 
+      # 九键左列换序：把 left_3 / left_4 的 restorationIdentifier 对调，
+      # 让「中英」落到第 3 格、「符号」落到第 4 格。脚本按固定 SHA-256 认状态，
+      # 对已对调的包不写文件，所以这一步可以重复执行。
+      - name: Swap nine-key left column IDs
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          python3 tools/nib_left_column.py \
+            --ipa base/gboard-ntr-1.0-unsigned.ipa \
+            --out dist/left-swapped.ipa
+
       - name: Swap dylib into the packed IPA
         run: |
           set -euo pipefail
           python3 tools/swap_dylib.py \
-            --ipa base/gboard-ntr-1.0-unsigned.ipa \
+            --ipa dist/left-swapped.ipa \
             --dylib new/libgkx.dylib \
             --out dist/gboard-ntr-1.0-unsigned.ipa
 

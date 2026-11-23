@@ -28,11 +28,11 @@ Holding the nine-key "，。？！" key for 0.32 s shows a row of symbols; slide
 **6. Diagnostic log (off by default)**
 Nothing is recorded by default. The switch lives in Settings → Gboard → Diagnostic log and takes effect across processes within half a second.
 
-**7. Map page**
-Fully reverted to native, with no redirection.
+**7. "中/英" label on the language key**
+The language key (3rd key of the nine-key left column and the top-right key of the 26-key layout) ships with a globe icon only; it now shows 中 and 英, the current language fully opaque and the other dimmed. The overlay is purely visual — touches and language switching stay on the native path — and switching language or pages no longer flashes the globe.
 
-**8. "中/英" label on the language key**
-The language key (4th key of the nine-key left column and the top-right key of the 26-key layout) ships with a globe icon only; it now shows 中 and 英, the current language fully opaque and the other dimmed. The overlay is purely visual — touches and language switching stay on the native path — and switching language or pages no longer flashes the globe.
+**8. Nine-key left column order**
+Top to bottom: 123 / pinyin / language / symbols. The original build has the language key fourth and symbols third, so the injection swaps the two restoration identifiers; the Auto Layout chain is untouched, which means no extra constraints and no flicker when switching pages.
 
 ---
 

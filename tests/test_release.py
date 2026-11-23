@@ -107,6 +107,14 @@ class WorkflowContracts(unittest.TestCase):
         self.assertIn("tools/publish_release.py", publish)
         self.assertIn("--refresh-sha", publish)
 
+    def test_publish_job_swaps_nine_key_left_column_before_dylib(self):
+        # 左列换序改的是 nib 字节，CI 不在原始包上重跑 inject，只能在成品包上补这一步；
+        # 顺序不能反：dylib 里的中英键 ID 与 nib 里的 ID 必须同时到位。
+        publish = self.text.split("publish:", 1)[1]
+        self.assertIn("tools/nib_left_column.py", publish)
+        self.assertLess(publish.index("tools/nib_left_column.py"),
+                        publish.index("tools/swap_dylib.py"))
+
     def test_publish_job_downloads_current_release_ipa(self):
         publish = self.text.split("publish:", 1)[1]
         self.assertIn("gh release download v1.0", publish)
