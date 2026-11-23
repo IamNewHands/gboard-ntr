@@ -19,7 +19,7 @@ Only the native emoji key on the nine-key layout and its symbol pages is replace
 - Suggestions without composition → **收起 (dismiss)**
 - Idle → **换行 (newline)**
 
-The native background, border and theme are preserved; only the foreground text changes.
+The native background, border and theme are preserved; only the foreground text changes. Switching pages no longer flashes the native emoji for a frame.
 
 **3. G-logo page trimming**
 The YouTube, Contacts, GIF and Sticker pages are removed, leaving emoji, kaomoji and the built-in pages. If a class disappears in a future Gboard build, that layer is skipped and behaviour degrades to native.
@@ -35,6 +35,11 @@ While off, no views are created and no strings are built. The switch lives in Se
 
 **7. Map page**
 Fully reverted to native. A keyboard extension cannot open the location settings page, so the earlier detour never worked on device and was removed entirely.
+
+**8. "中/英" label on the language key**
+The language key (4th key of the nine-key left column and the top-right key of the 26-key layout) ships with a globe icon only. It now shows 中 and 英, the current language fully opaque and the other dimmed, with the native font and colours. The overlay is purely visual: touches still reach the native key underneath and language switching stays on the native path.
+
+Each key owns its own overlay as a subview, so the same turn that native redraws or re-fronts the key puts the overlay back on top — no polling catch-up frame. Switching language or pages no longer flashes the native globe.
 
 ---
 
@@ -58,6 +63,7 @@ gboard-ntr/
 │   ├── dict_converter.py      # Wanxiang dictionary → compact Protobuf
 │   ├── inspect_signed.py      # read-only Mach-O / permission self-check
 │   ├── swap_dylib.py          # replace libgkx.dylib inside a packed IPA (CI)
+│   ├── verify_release_package.py # read-only: only the dylib changed, and it matches CI
 │   └── publish_release.py     # publish to GitHub Release
 ├── tests/                     # source-level contract tests
 ├── .github/workflows/         # CI: build dylib → swap → publish
