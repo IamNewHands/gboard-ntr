@@ -668,10 +668,24 @@ static GXKActionKeyTarget *gActionTarget;
 
 #import "action_key_display.h"
 
+// 原生换语言/换页时可能先给「已从键上摘下来的」icon 写图，再把它挂回去；
+// 那一拍沿 superview 往上走根本找不到键，写入就漏到原生圆图标上。绑定里记着
+// 这把键认领过的 icon 实例，按实例直接认回来，不依赖当时的视图树。
+static UIView *GXKLangPreparedKeyForIcon(UIView *icon) {
+    if (!icon) return nil;
+    for (UIView *key in gLangDisplayKeys.allObjects) {
+        GXKLangDisplayBinding *binding = GXKLangBindingFor(key);
+        if (binding.prepared && binding.icon == icon) return key;
+    }
+    return nil;
+}
+
 // Guard only the current dictionary icon with an attached same-key label.
 // A peer may retain its own text, never borrow a global button or authorize input.
 static UIView *GXKGuardedKeyForIcon(UIView *icon) {
     if (gxk_icon_write_bypass || !icon) return nil;
+    UIView *claimed = GXKLangPreparedKeyForIcon(icon);
+    if (claimed) return claimed;
     Class keyClass = GXKClassCached(@"GKBSoftKeyView", &gCachedKeyClass);
     for (UIView *key = icon.superview; key; key = key.superview) {
         if (![key isKindOfClass:keyClass]) continue;

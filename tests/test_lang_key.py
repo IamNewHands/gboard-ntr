@@ -113,6 +113,21 @@ class LangKeySourceContracts(unittest.TestCase):
         # 没接管过的键不动：否则会触发多余重画。
         self.assertIn("if (!binding || !binding.prepared) continue;", detach)
 
+    def test_guard_claims_the_archived_icon_even_when_it_is_detached(self):
+        """原生可能先给已摘下的 icon 写图再挂回键：那一拍沿 superview 找不到键。
+
+        绑定里记着这把键认领过的 icon 实例，必须按实例直接认回来，否则这一帧
+        原生圆图标会落到键上闪一下 —— 正是本次要修的闪。
+        """
+        fallback = function_body(self.source, "static UIView *GXKLangPreparedKeyForIcon(UIView *icon) {")
+        self.assertIn("gLangDisplayKeys.allObjects", fallback)
+        self.assertIn("binding.prepared && binding.icon == icon", fallback)
+        guard = function_body(self.source, "static UIView *GXKGuardedKeyForIcon(UIView *icon) {")
+        # 实例认领必须排在 superview 遍历之前：树里已经找不到它了。
+        self.assertLess(guard.index("GXKLangPreparedKeyForIcon(icon)"),
+                        guard.index("icon.superview"))
+        self.assertIn("if (claimed) return claimed;", guard)
+
     def test_guard_branch_runs_before_the_emoji_early_returns(self):
         guard = function_body(self.source, "static void gxk_key_updateView(id self, SEL _cmd) {")
         self.assertIn("gxk_lang_updateView(key)", guard)
