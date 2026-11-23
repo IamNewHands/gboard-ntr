@@ -16,6 +16,7 @@
 #import <objc/message.h>
 #import <string.h>
 #import <math.h>
+#import <stdio.h>
 
 #define GXK_LOG(fmt, ...) NSLog(@"[GXK] " fmt, ##__VA_ARGS__)
 #define GXK_ACTION_TAG 0x47584B41  // 'GXKA'
@@ -744,18 +745,34 @@ static void (*gOrigKeySetSoftKeyDef)(id, SEL, id);
 static void (*gOrigKeyDidMoveToSuperview)(id, SEL);
 static void (*gOrigKeyDidMoveToWindow)(id, SEL);
 
+// Temporary CI-only reentrancy probe. Remove with the other [DEBUG-native-ci] lines.
+static int gDebugHookDepth;
+static void GXKDebugHook(const char *what, UIView *view) {
+    gDebugHookDepth++;
+    if (gDebugHookDepth > 8) {
+        fprintf(stderr, "[DEBUG-native-ci] REENTRY %s depth=%d view=%p class=%s\n",
+            what, gDebugHookDepth, (__bridge void *)view, class_getName(object_getClass(view)));
+        fflush(stderr);
+    }
+}
+static void GXKDebugHookExit(void) { gDebugHookDepth--; }
+
 static void gxk_key_updateView(id self, SEL _cmd) {
+    GXKDebugHook("updateView", (UIView *)self);
     if (gOrigKeyUpdateView) gOrigKeyUpdateView(self, _cmd);
     UIView *key = (UIView *)self;
     gxk_lang_updateView(key);
     GXKReconcileActionDisplay(key);
+    GXKDebugHookExit();
 }
 static void gxk_key_setSoftKeyDef(id self, SEL _cmd, id model) {
+    GXKDebugHook("setSoftKeyDef", (UIView *)self);
     UIView *key = (UIView *)self;
     id previous = [key respondsToSelector:@selector(softKeyDef)] ? ((id<GXKNativeSoftKeyContent>)key).softKeyDef : nil;
     if (previous != model) GXKInvalidateActionDisplay(key);
     if (gOrigKeySetSoftKeyDef) gOrigKeySetSoftKeyDef(self, _cmd, model);
     GXKReconcileActionDisplay(key);
+    GXKDebugHookExit();
 }
 static void gxk_key_didMoveToSuperview(id self, SEL _cmd) {
     GXKInvalidateActionDisplay((UIView *)self);

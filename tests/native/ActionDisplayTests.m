@@ -5,11 +5,42 @@
 #import <XCTest/XCTest.h>
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
+#import <objc/runtime.h>
 #import <stdio.h>
 
 // Temporary CI-only boundary probe. Remove after the shared SIGSEGV is located.
 static void GXKDebugNativePhase(const char *phase) {
     fprintf(stderr, "[DEBUG-native-ci] %s\n", phase);
+    fflush(stderr);
+}
+
+// Bounded subtree walk: a parent cycle surfaces as CYCLE instead of a hang.
+static NSUInteger GXKDebugDepth(UIView *view) {
+    if (!view) return 0;
+    NSMutableArray *stack = [NSMutableArray arrayWithObject:@[view, @0]];
+    NSMutableSet *seen = [NSMutableSet set];
+    NSUInteger deepest = 0, visited = 0;
+    while (stack.count && visited++ < 4000) {
+        NSArray *item = stack.lastObject;
+        [stack removeLastObject];
+        UIView *v = item[0];
+        NSUInteger d = [item[1] unsignedIntegerValue];
+        if ([seen containsObject:v]) {
+            fprintf(stderr, "[DEBUG-native-ci] CYCLE %s at depth %lu class=%s\n",
+                "subtree", (unsigned long)d, class_getName(object_getClass(v)));
+            fflush(stderr);
+            return 9999;
+        }
+        [seen addObject:v];
+        if (d > deepest) deepest = d;
+        for (UIView *s in v.subviews) [stack addObject:@[s, @(d + 1)]];
+    }
+    return deepest;
+}
+
+static void GXKDebugDepthPhase(const char *phase, UIView *view) {
+    fprintf(stderr, "[DEBUG-native-ci] %s depth=%lu subviews=%lu\n",
+        phase, (unsigned long)GXKDebugDepth(view), (unsigned long)view.subviews.count);
     fflush(stderr);
 }
 
@@ -135,10 +166,15 @@ static void GXKDebugNativePhase(const char *phase) {
 - (void)setSoftKeyDef:(GXKFixtureSoftKeyDef *)model {
     if (model == _fixtureDef) return;
     BOOL rebuild = !_fixtureDef || ![_fixtureDef.layout isEqualToString:model.layout];
+    GXKDebugNativePhase("setter: before reset");
     if (rebuild) [self resetView];
+    GXKDebugDepthPhase("setter: after reset", self);
     _fixtureDef = model;
     if (rebuild) [self buildNativeContents];
+    GXKDebugDepthPhase("setter: after build", self);
+    GXKDebugNativePhase("setter: before updateView");
     [self updateView];
+    GXKDebugDepthPhase("setter: after updateView", self);
 }
 - (void)resetView {
     // Stock resetView removes every child of hostView, including foreign children.
@@ -176,13 +212,17 @@ static void GXKDebugNativePhase(const char *phase) {
     [self updateView];
 }
 - (void)updateView {
+    GXKDebugDepthPhase("updateView: entry", self);
     self.nativeUpdateCount++;
     GKBImageViewWithBackground *icon = self.idToViewDict[@"image"];
     UIView *native = self.hostView.subviews.firstObject;
     NSAssert(!icon || native == icon || [icon isDescendantOfView:native],
              @"Native update must find the real content in hostView.subviews.firstObject.");
+    GXKDebugNativePhase("updateView: before normalImage");
     icon.image = self.softKeyDef.normalImage;
+    GXKDebugNativePhase("updateView: after normalImage");
     icon.highlightedImage = self.softKeyDef.highlightedImage;
+    GXKDebugNativePhase("updateView: after highlightedImage");
 }
 - (void)layoutSubviews {
     [super layoutSubviews];
@@ -339,6 +379,22 @@ static NSUInteger GXKFixtureBluePixels(NSData *data) {
     gCurrentVC = self.controller;
     self.body = [[GKB9KeysSoftKeyboardView alloc] initWithFrame:CGRectMake(0, 120, 390, 260)];
     [self.controller.view addSubview:self.body];
+    // Bisect: same fixture construction with the dylib icon guards bypassed.
+    // Surviving here means the guarded write path, not UIKit, owns the crash.
+    GXKDebugNativePhase("hookless probe: before");
+    {
+        BOOL bypass = gxk_icon_write_bypass;
+        gxk_icon_write_bypass = YES;
+        GKBSoftKeyView *probe = [[GKBSoftKeyView alloc] initWithFrame:CGRectMake(0, 0, 48, 44)];
+        probe.restorationIdentifier = @"key_pos_9keys_return";
+        GXKFixtureSoftKeyDef *probeModel = [self modelWithActions:@[] layout:@"hookless-probe"];
+        GXKDebugNativePhase("hookless probe: before model assignment");
+        probe.softKeyDef = probeModel;
+        GXKDebugNativePhase("hookless probe: after model assignment");
+        probe = nil;
+        gxk_icon_write_bypass = bypass;
+    }
+    GXKDebugNativePhase("hookless probe: after");
     GXKDebugNativePhase("before native return key construction");
     self.returnKey = [self makeKey:@"key_pos_9keys_return" separateHost:NO attach:NO];
     GXKDebugNativePhase("after native return key construction");

@@ -12,8 +12,8 @@
 static char gCrashAltStack[GXK_CRASH_STACK_BYTES];
 
 static void GXKCrashHandler(int sig) {
-    void *frames[96];
-    int count = backtrace(frames, 96);
+    void *frames[400];
+    int count = backtrace(frames, 400);
     static const char header[] = "\n[DEBUG-native-ci] fatal signal, stack follows\n";
     ssize_t written = write(STDERR_FILENO, header, sizeof(header) - 1);
     (void)written;

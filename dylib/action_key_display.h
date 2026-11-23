@@ -169,6 +169,29 @@ static void GXKRecordActionIconWrite(UIView *icon, UIImage *image, BOOL highligh
     }
 }
 
+// Temporary CI-only depth probe shared by reconcile diagnostics.
+static NSUInteger GXKDebugSubtreeDepth(UIView *view) {
+    NSUInteger deepest = 0, visited = 0;
+    NSMutableArray *stack = [NSMutableArray arrayWithObject:@[view, @0]];
+    NSMutableSet *seen = [NSMutableSet set];
+    while (stack.count && visited++ < 4000) {
+        NSArray *item = stack.lastObject;
+        [stack removeLastObject];
+        UIView *v = item[0];
+        NSUInteger d = [item[1] unsignedIntegerValue];
+        if ([seen containsObject:v]) {
+            fprintf(stderr, "[DEBUG-native-ci] CYCLE view=%p at depth %lu\n",
+                (__bridge void *)v, (unsigned long)d);
+            fflush(stderr);
+            return 9999;
+        }
+        [seen addObject:v];
+        if (d > deepest) deepest = d;
+        for (UIView *s in v.subviews) [stack addObject:@[s, @(d + 1)]];
+    }
+    return deepest;
+}
+
 static void GXKReconcileActionDisplay(UIView *key) {
     if (!key) return;
     GXKActionDisplayBinding *binding = GXKActionDisplayForKey(key);
@@ -278,11 +301,23 @@ static void GXKReconcileActionDisplay(UIView *key) {
     if (!CGRectEqualToRect(binding.label.frame, key.bounds)) binding.label.frame = key.bounds;
     binding.label.hidden = NO;
     // Native content is already first. Append to key, not the native dictionary.
-    if (binding.label.superview != key) [key addSubview:binding.label];
+    if (binding.label.superview != key) {
+        fprintf(stderr, "[DEBUG-native-ci] bind label add key=%p(%s) subviews=%lu depth=%lu\n",
+            (__bridge void *)key, class_getName(object_getClass(key)),
+            (unsigned long)key.subviews.count, (unsigned long)GXKDebugSubtreeDepth(key));
+        fflush(stderr);
+        [key addSubview:binding.label];
+    }
     if (key.subviews.lastObject != binding.label) [key bringSubviewToFront:binding.label];
     CGRect inputRect = [key convertRect:key.bounds toView:host];
     if (!CGRectEqualToRect(binding.inputButton.frame, inputRect)) binding.inputButton.frame = inputRect;
-    if (binding.inputButton.superview != host) [host addSubview:binding.inputButton];
+    if (binding.inputButton.superview != host) {
+        fprintf(stderr, "[DEBUG-native-ci] bind input add host=%p(%s) key=%p subviews=%lu depth=%lu\n",
+            (__bridge void *)host, class_getName(object_getClass(host)), (__bridge void *)key,
+            (unsigned long)host.subviews.count, (unsigned long)GXKDebugSubtreeDepth(host));
+        fflush(stderr);
+        [host addSubview:binding.inputButton];
+    }
     if (host.subviews.lastObject != binding.inputButton) [host bringSubviewToFront:binding.inputButton];
     binding.inputButton.accessibilityLabel = title;
     binding.inputButton.accessibilityTraits = UIAccessibilityTraitKeyboardKey |
