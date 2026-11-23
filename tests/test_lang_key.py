@@ -170,6 +170,32 @@ class LangKeySourceContracts(unittest.TestCase):
         for action_storage in ("GXKActionDisplayForKey", "gActionNormalImage", "gActionHighlightedImage"):
             self.assertNotIn(action_storage, lang_guard)
 
+    def test_language_guard_is_keyed_by_the_key_not_by_the_icon_instance(self):
+        """原生换语言/换主题会重建 idToViewDict 里的 icon 实例，身份比对会漏帧。"""
+        guard = function_body(self.source, "static UIView *GXKGuardedKeyForIcon(UIView *icon) {")
+        lang = guard.index("key == gGuardLangKey && GXKLangKeyIDMatches(key)")
+        identity = guard.index("GXKNativeIconForKey(key) != icon")
+        # 中英键分支必须排在 icon 身份比对之前，否则新实例上的原生写入不会被拦。
+        self.assertLess(lang, identity)
+        # 但中英键仍必须是键本身，不能借用别的键的 icon。
+        self.assertIn("GXKLangKeyIDMatches(key)", guard)
+
+    def test_key_lifecycle_callbacks_rebind_the_language_overlay_in_place(self):
+        for signature in (
+            "static void gxk_key_setSoftKeyDef(id self, SEL _cmd, id model) {",
+            "static void gxk_key_didMoveToSuperview(id self, SEL _cmd) {",
+            "static void gxk_key_didMoveToWindow(id self, SEL _cmd) {",
+        ):
+            body = function_body(self.source, signature)
+            self.assertIn("GXKLangRebindKey", body, signature)
+        rebind = function_body(self.source, "static void GXKLangRebindKey(UIView *key) {")
+        # 轻量路径：不做全树扫描，也不改键外观。
+        for retired in ("GXKFindLangKey", "GXKUpdateLangKey", "hidden", "alpha", "backgroundColor"):
+            self.assertNotIn(retired, rebind)
+        self.assertIn("key != gLangKeyView", rebind)
+        self.assertIn("gUpdatingLangKey", rebind)
+        self.assertIn("GXKClearIconImages(icon)", rebind)
+
     def test_action_and_language_teardown_remain_separate_on_disappearance(self):
         gone = function_body(self.source, "static void gkx_viewWillDisappear(id self, SEL _cmd, BOOL animated) {")
         self.assertIn("GXKDetachActionKey()", gone)

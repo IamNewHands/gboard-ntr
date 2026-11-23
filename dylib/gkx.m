@@ -593,6 +593,7 @@ static BOOL gxk_icon_block_hooked;
 static BOOL gxk_icon_write_bypass;
 static BOOL GXKLangKeyIDMatches(UIView *key);
 static void gxk_lang_updateView(UIView *key);
+static void GXKLangRebindKey(UIView *key);
 
 // Stock GKBImageLayer actionForKey: returns nil. This transaction groups our
 // own writes; it is not evidence of a native implicit fade.
@@ -631,9 +632,12 @@ static UIView *GXKGuardedKeyForIcon(UIView *icon) {
     Class keyClass = GXKClassCached(@"GKBSoftKeyView", &gCachedKeyClass);
     for (UIView *key = icon.superview; key; key = key.superview) {
         if (![key isKindOfClass:keyClass]) continue;
+        // 中英键按「键」守卫，不按 icon 身份：原生换语言/换主题会整批重建
+        // idToViewDict 里的 icon 实例，写入发生时字典可能还没换上它，
+        // 身份比对会漏掉这一帧，原生圆图标就落到键上闪一下。
+        if (key == gGuardLangKey && GXKLangKeyIDMatches(key)) return key;
         if (GXKNativeIconForKey(key) != icon) return nil;
         if (GXKActionDisplayCoversIcon(icon)) return key;
-        if (key == gGuardLangKey && GXKLangKeyIDMatches(key)) return key;
         return nil;
     }
     return nil;
@@ -755,18 +759,21 @@ static void gxk_key_setSoftKeyDef(id self, SEL _cmd, id model) {
     id previous = [key respondsToSelector:@selector(softKeyDef)] ? ((id<GXKNativeSoftKeyContent>)key).softKeyDef : nil;
     if (previous != model) GXKInvalidateActionDisplay(key);
     if (gOrigKeySetSoftKeyDef) gOrigKeySetSoftKeyDef(self, _cmd, model);
+    GXKLangRebindKey(key); // 模型换了：中英覆盖层立刻就地重绑并提到最上层。
     GXKReconcileActionDisplay(key);
 }
 static void gxk_key_didMoveToSuperview(id self, SEL _cmd) {
     GXKInvalidateActionDisplay((UIView *)self);
     GXKBumpKeyCacheEpoch();
     if (gOrigKeyDidMoveToSuperview) gOrigKeyDidMoveToSuperview(self, _cmd);
+    GXKLangRebindKey((UIView *)self);
     GXKReconcileActionDisplay((UIView *)self);
 }
 static void gxk_key_didMoveToWindow(id self, SEL _cmd) {
     GXKInvalidateActionDisplay((UIView *)self);
     GXKBumpKeyCacheEpoch();
     if (gOrigKeyDidMoveToWindow) gOrigKeyDidMoveToWindow(self, _cmd);
+    GXKLangRebindKey((UIView *)self);
     GXKReconcileActionDisplay((UIView *)self);
 }
 
@@ -994,6 +1001,37 @@ static void GXKDetachLangKey(void) {
         }
     }
     gUpdatingLangKey = wasUpdating;
+}
+
+// 键生命周期回调里的轻量重绑：只在「这把键就是当前中英键」时跑，不做全树扫描。
+// 原生换语言/换主题/换页会就地改 softKeyDef 甚至换掉 idToViewDict 里的 icon 实例，
+// 覆盖层必须跟着换绑，否则要等到下一拍轮询才补上，中间露出原生圆图标。
+static void GXKLangRebindKey(UIView *key) {
+    if (!key || key != gLangKeyView || gUpdatingLangKey) return;
+    if (!GXKLangKeyIDMatches(key)) return;
+    UIButton *btn = gLangKeyButton;
+    UIView *host = gLangHost;
+    if (!btn) return;
+    if (btn.superview != host) {
+        // 换页会把键搬到新的容器：宿主跟着换，否则覆盖层留在旧容器里不再跟随。
+        UIView *freshHost = GXKActionHostForKey(key);
+        if (!freshHost) return;
+        host = freshHost;
+        gLangHost = freshHost;
+        [freshHost addSubview:btn];
+    }
+    UIView<GXKNativeIconContent> *icon = GXKNativeIconForKey(key);
+    if (icon) {
+        // 换的是 icon 实例：存档跟着换成新实例的图，守卫与廉价路径才对得上。
+        gLangNativeIcon = icon;
+        gLangSoftKeyDef = ((id<GXKNativeSoftKeyContent>)key).softKeyDef;
+        if (icon.image) gLangNormalImage = icon.image;
+        if (icon.highlightedImage) gLangHighlightedImage = icon.highlightedImage;
+        GXKClearIconImages(icon); // 原生重画立刻搬走，别让它落在键上。
+    }
+    CGRect rect = [key convertRect:key.bounds toView:host];
+    if (!CGRectEqualToRect(btn.frame, rect)) btn.frame = rect;
+    if (host.subviews.lastObject != btn) [host bringSubviewToFront:btn];
 }
 
 static void GXKUpdateLangKey(UIViewController *vc) {
