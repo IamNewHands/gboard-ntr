@@ -351,6 +351,32 @@ static NSUInteger GXKFixtureBluePixels(NSData *data) {
 - (void)setUp {
     [super setUp];
     XCTAssertTrue(NSThread.isMainThread, @"UIKit fixture must execute on the main thread.");
+    // Bisect the fixture view classes. The crash reproduces with no dylib hooks,
+    // so isolate which fixture class corrupts UIKit's view tree.
+    GXKDebugNativePhase("b1: before plain container");
+    {
+        UIView *container = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 48, 44)];
+        UIView *plain = [[UIView alloc] initWithFrame:container.bounds];
+        GXKDebugNativePhase("b1: before plain addSubview");
+        [container addSubview:plain];
+        GXKDebugNativePhase("b1: after plain addSubview");
+        GXKDebugNativePhase("b2: before CALayer subclass sublayer");
+        GKBImageLayer *layer = [[GKBImageLayer alloc] init];
+        layer.frame = container.bounds;
+        [container.layer addSublayer:layer];
+        GXKDebugNativePhase("b2: after CALayer subclass sublayer");
+        GXKDebugNativePhase("b3: before icon alloc");
+        GKBImageViewWithBackground *icon = [[GKBImageViewWithBackground alloc] initWithFrame:container.bounds];
+        fprintf(stderr, "[DEBUG-native-ci] b3: icon sublayers=%lu layerClass=%s\n",
+            (unsigned long)icon.layer.sublayers.count, class_getName(object_getClass(icon.layer)));
+        fflush(stderr);
+        GXKDebugNativePhase("b3: after icon alloc");
+        GXKDebugNativePhase("b4: before icon addSubview");
+        [container addSubview:icon];
+        GXKDebugNativePhase("b4: after icon addSubview");
+        container = nil;
+    }
+    GXKDebugNativePhase("b: all fixture classes survived");
     // Bisect 1: identical fixture construction with NO dylib hooks installed.
     // Surviving here means the dylib hook path owns the crash.
     GXKDebugNativePhase("pre-hook probe: before alloc");
