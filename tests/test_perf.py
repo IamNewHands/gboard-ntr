@@ -667,6 +667,10 @@ class PerfContracts(unittest.TestCase):
         self.assertIn("BOOL diag = GXKPunctDiagEnabled();", find)
         self.assertIn("NSMutableArray<NSString *> *seenIdents = diag ? [NSMutableArray array] : nil;", find)
         self.assertIn("if (diag && ident.length && ![seenIdents containsObject:ident])", find)
+        # 无 ident 的键帽文字清单同样只在诊断打开时建：数字页每帧都要扫这棵树。
+        self.assertIn("NSMutableArray<NSString *> *seenLabels = diag ? [NSMutableArray array] : nil;", find)
+        self.assertIn("if (diag && ident.length == 0) {", find)
+        self.assertIn("if (text.length && ![seenLabels containsObject:text]) [seenLabels addObject:text];", find)
         self.assertLess(find.index("if (diag) {"), find.index("gDiagFindMiss++"))
         self.assertLess(find.index("gDiagFindMiss++"), find.index("componentsJoinedByString"))
 
