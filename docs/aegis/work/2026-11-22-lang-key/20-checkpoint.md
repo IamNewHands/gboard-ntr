@@ -87,3 +87,10 @@ NSExtensionPrincipalClass = "GKBUIInputViewController"
 - 契约测试重写为 17 项（`gboard-ntr/tests/test_lang_key.py`），新增 `test_overlay_is_owned_by_the_key_itself` 锁定「按钮必须是键的子视图且同拍提到最前」，并禁止 `[host addSubview:btn]` 与 `GXKActionHostForKey` 出现在 reconcile 里；`gboard-ntr/tests/test_action_key.py:256` 由 `gGuardLangKey` 改为断言 `GXKLangBindingFor(key).prepared`。
 - 验证：`python -m unittest discover -s tests -p 'test_*.py'` → **190 项 OK**，`git diff --check` 干净。**未编译**（本机无 iOS clang/SDK），**未 commit/push**，**未出新 IPA**。
 - 已知未验：本机无法证明 UIKit 运行时零闪；native fixture 仍有既存 SIGSEGV（CI 里已 `continue-on-error`，与本改动无关），arm64 编译与新包只能走 CI。
+### 第三版补丁：已摘下的 icon 也按实例认领（2026-11-23 14:17，已推送/待 CI 出包）
+
+- 缺口：原生换语言/换页时可能先给**已从键上摘下来**的 icon 写图，再把它挂回去。那一拍沿 `superview` 往上走根本找不到 `GKBSoftKeyView`，`GXKGuardedKeyForIcon` 直接返回 nil，写入漏到原生圆图标上 —— 又是一帧闪。
+- 补法：新增 `GXKLangPreparedKeyForIcon(UIView *icon)`（`gboard-ntr/dylib/gkx.m:673-682`），遍历 `gLangDisplayKeys.allObjects`，用 `binding.prepared && binding.icon == icon` 按实例把键认回来；`GXKGuardedKeyForIcon` 第一句就调它，排在 `icon.superview` 遍历之前。
+- 契约：新增 `test_guard_claims_the_archived_icon_even_when_it_is_detached`（`gboard-ntr/tests/test_lang_key.py`），断言实例认领早于 superview 遍历。
+- 验证：`python -m unittest discover -s tests -p 'test_*.py'` → **191 项 OK**，`git diff --check` 干净。
+- 推送：`68ff697`（逐键绑定主体）与 `fcc4853`（icon 实例兜底）已正常推送 origin/main。`68ff697` 的 run 45121861666 已确认 arm64 **编译通过**（build/Sign/artifact/builds 分支全 success）；`fcc4853` 的 run 45123149241 在跑，出包结果待收。
