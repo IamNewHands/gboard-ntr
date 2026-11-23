@@ -70,7 +70,8 @@ class PerfContracts(unittest.TestCase):
         layout = function_body(self.source, "static void gkx_viewDidLayoutSubviews(id self, SEL _cmd) {")
         self.assertIn("GXKBumpKeyCacheEpoch()", layout)
         # 撤键即作废，下次从头认当前布局。
-        detach = function_body(self.source, "static void GXKDetachActionKey(void) {")
+        display = (ROOT / "dylib/action_key_display.h").read_text(encoding="utf-8")
+        detach = function_body(display, "static void GXKDetachActionKey(void)")
         self.assertIn("GXKClearEmojiKeyCache()", detach)
         detach_lang = function_body(self.source, "static void GXKDetachLangKey(void) {")
         self.assertIn("GXKClearLangKeyCache()", detach_lang)
@@ -90,37 +91,34 @@ class PerfContracts(unittest.TestCase):
         # 旧的无条件常驻表必须消失，否则空闲仍每秒唤醒 5 次。
         self.assertNotIn("if (!gStatePollTimer) {", self.source)
 
-    def test_update_has_cheap_path_before_full_scan(self):
-        update = function_body(self.source, "static void GXKUpdateActionKey(UIViewController *vc) {")
-        # 廉价路径只问标题（内部走 O(1) 组字缓存），不定位候选也不扫全树。
-        cheap = update.index("GXKActionTitle(vc)")
-        full = update.index("GXKFindNineKeyEmojiKey(root)")
-        self.assertLess(cheap, full, "cheap path must run before the full tree scan")
-        head = update[:full]
-        self.assertIn("gActionKeyButton.superview == gActionHost", head)
-        self.assertIn("GXKKeyIsVisible(gEmojiSoftKeyView, root)", head)
-        self.assertIn("GXKModelHasNativeActions(gActionSoftKeyDef)", head)
+    def test_action_refresh_uses_existing_key_bindings_not_a_cross_page_button(self):
+        display = (ROOT / "dylib/action_key_display.h").read_text(encoding="utf-8")
+        update = function_body(display, "static void GXKUpdateActionKey(UIViewController *vc)")
+        self.assertIn("GXKReconcileActionDisplay", update)
+        self.assertNotIn("GXKFindNineKeyEmojiKey", update,
+                         "Unique input validation is for taps, not each polling frame")
+        for retired in ("gActionKeyButton", "gActionHost", "GXKKeepLiveBinding", "canRetarget"):
+            self.assertNotIn(retired, self.source + display)
 
-    def test_cheap_path_still_fails_closed(self):
-        update = function_body(self.source, "static void GXKUpdateActionKey(UIViewController *vc) {")
-        head = update[:update.index("GXKFindNineKeyEmojiKey(root)")]
-        for required in (
-            "gEmojiSoftKeyView &&",
-            "gActionNativeIcon &&",
-            "gActionSoftKeyDef &&",
-            "gActionKeyButton &&",
-            "gActionHost &&",
-        ):
-            self.assertIn(required, head)
-        self.assertIn("GXKNativeIconForKey(gEmojiSoftKeyView) == gActionNativeIcon", head)
-        self.assertIn("softKeyDef == gActionSoftKeyDef", head)
+    def test_per_key_reconcile_does_not_scan_the_controller_tree(self):
+        display = (ROOT / "dylib/action_key_display.h").read_text(encoding="utf-8")
+        reconcile = function_body(display, "static void GXKReconcileActionDisplay(UIView *key)")
+        self.assertNotIn("GXKFindNineKeyEmojiKey", reconcile)
+        self.assertNotIn("GXKComposingFullScan", reconcile)
+        self.assertNotIn("NSStringFromClass", reconcile)
+        self.assertNotIn("dispatch_after", reconcile)
+        self.assertIn("GXKNativeIconForKey", reconcile)
+        self.assertIn("GXKActionDisplayForKey", reconcile)
 
-    def test_cheap_path_keeps_native_foreground_stripped(self):
-        update = function_body(self.source, "static void GXKUpdateActionKey(UIViewController *vc) {")
-        head = update[:update.index("GXKFindNineKeyEmojiKey(root)")]
-        self.assertIn("cheapIcon.image = nil", head)
-        self.assertIn("cheapIcon.highlightedImage = nil", head)
-        self.assertIn("gActionNormalImage = cheapIcon.image", head)
+    def test_no_new_display_timer_or_deadline_repeats_native_work(self):
+        display = (ROOT / "dylib/action_key_display.h").read_text(encoding="utf-8")
+        for retired in ("scheduledTimer", "dispatch_after", "CFAbsoluteTimeGetCurrent", "gFlashDeadline",
+                        "GXK_FLASH_GRACE_SECONDS", "GXK_REBIND_WAIT_SECONDS", "GXK_PARK_SECONDS"):
+            self.assertNotIn(retired, display)
+        coverage = function_body(display, "static BOOL GXKActionDisplayCoversIcon(")
+        self.assertNotIn("GXKFindNineKeyEmojiKey", coverage)
+        self.assertNotIn("GXKComposingFullScan", coverage)
+        self.assertNotIn("NSStringFromClass", coverage)
 
     def test_composing_scan_is_event_driven_not_polled(self):
         self.assertIn("static void GXKRefreshComposingState(UIViewController *vc)", self.source)
@@ -407,10 +405,12 @@ class PerfContracts(unittest.TestCase):
         self.assertIn("if (seq != gLayoutSeq) return;", layout)
         self.assertLess(layout.index("if (seq != gLayoutSeq) return;"),
                         layout.index("GXKRefreshComposingState(vc)"))
-        # 布局回调不得再同步跑全量刷新，必须整体挪进异步块。
+        # 全树发现仍合并异步；已登记的逐键显示必须在原生 layout 返回后同栈完成。
         sync_part = layout[:layout.index("dispatch_async")]
         self.assertNotIn("GXKUpdateToolbar", sync_part)
-        self.assertNotIn("GXKUpdateActionKey", sync_part)
+        self.assertNotIn("GXKRefreshComposingState", sync_part)
+        self.assertNotIn("GXKFindNineKeyEmojiKey", sync_part)
+        self.assertIn("GXKUpdateActionKey((UIViewController *)self)", sync_part)
 
     def test_hot_scan_paths_cache_class_pointers(self):
         """扫描热路径只解析一次类指针，不在每个软键上重复 NSClassFromString。"""

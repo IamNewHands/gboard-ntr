@@ -95,7 +95,8 @@ class LangKeySourceContracts(unittest.TestCase):
     def test_guard_branch_runs_before_the_emoji_early_returns(self):
         guard = function_body(self.source, "static void gxk_key_updateView(id self, SEL _cmd) {")
         self.assertIn("gxk_lang_updateView(key)", guard)
-        self.assertLess(guard.index("gxk_lang_updateView(key)"), guard.index("key != gGuardKey"))
+        self.assertLess(guard.index("gxk_lang_updateView(key)"),
+                        guard.index("GXKReconcileActionDisplay(key)"))
         lang_guard = function_body(self.source, "static void gxk_lang_updateView(UIView *key) {")
         self.assertIn("key != gGuardLangKey", lang_guard)
         self.assertIn("GXKLangKeyIDMatches(key)", lang_guard)
@@ -147,88 +148,37 @@ class LangKeySourceContracts(unittest.TestCase):
         ):
             self.assertIn("GXKDetachLangKey", function_body(self.source, signature), signature)
 
-    def test_page_switch_grace_window_is_bounded_and_restores_native(self):
-        """切页宽限按身份生效（重建出来的新实例也算），但必须到点交还原生。"""
-        helper = function_body(self.source, "static BOOL gxk_flash_grace_active(UIView *key) {")
-        # 旧实例直接命中；原生切页会重建表情键，新实例只能按「可见九键表情键」认。
-        self.assertIn("key == gFlashKey", helper)
-        self.assertIn("GXKNineKeyBodyForKey(key, gCurrentVC.view)", helper)
-        # 有界：到点一律放行，绝不能变成长期接管。
-        self.assertIn("CFAbsoluteTimeGetCurrent() >= gFlashDeadline", helper)
-        self.assertIn("GXKEmojiKeyID", helper)
-        # 宽限不能在空转 detach 里被清零：那会让守卫在刚建立的窗口上当场放行。
-        detach_head = function_body(self.source, "static void GXKDetachActionKey(void) {")
-        early = detach_head.index("if (!gEmojiSoftKeyView && !gActionKeyButton")
-        self.assertLess(early, detach_head.index("gFlashDeadline = oldKey ?"))
-        guard = function_body(self.source, "static void gxk_key_updateView(id self, SEL _cmd) {")
-        self.assertIn("key != gGuardKey && !gxk_flash_grace_active(key)", guard)
-        # 宽限不能变成第二条归属：守卫仍要求键 ID 是九键表情键。
-        self.assertLess(guard.index("gxk_flash_grace_active(key)"),
-                        guard.index("isEqualToString:GXKEmojiKeyID]"))
-        detach = function_body(self.source, "static void GXKDetachActionKey(void) {")
-        self.assertIn("gFlashDeadline = oldKey ?", detach)
-        self.assertLess(detach.index("gFlashKey = oldKey"), detach.index("gGuardKey = nil"))
-        # 到点还原必须自愈：轮询空闲会停表，只在更新路径里作废会让键停在空白前景。
-        expire = function_body(self.source, "static void GXKExpireFlashGraceIfNeeded(void) {")
-        self.assertIn("CFAbsoluteTimeGetCurrent() < gFlashDeadline", expire)
-        self.assertIn("expired != gEmojiSoftKeyView", expire)
-        self.assertLess(expire.index("gFlashKey = nil"), expire.index("updateView]"))
-        for signature in (
-            "static void gxk_key_updateView(id self, SEL _cmd) {",
-            "static void GXKUpdateActionKey(UIViewController *vc) {",
-        ):
-            self.assertIn("GXKExpireFlashGraceIfNeeded()", function_body(self.source, signature), signature)
+    def test_action_display_timers_are_retired_not_language_dependencies(self):
+        """Action drawing ownership must not leak into the language-key owner."""
+        display = (ROOT / "dylib/action_key_display.h").read_text(encoding="utf-8")
+        for retired in ("gxk_flash_grace_active", "GXKExpireFlashGraceIfNeeded",
+                        "GXKClearFlashGrace", "GXKClearRebindPending", "gxk_rebind_hold",
+                        "GXK_PARK_SECONDS", "GXK_FLASH_GRACE_SECONDS", "GXK_REBIND_WAIT_SECONDS"):
+            self.assertNotIn(retired, self.source + display)
+        lang = function_body(self.source, "static void GXKUpdateLangKey(UIViewController *vc) {")
+        for action_owner in ("GXKActionDisplayBinding", "GXKReconcileActionDisplay",
+                             "GXKDetachActionKey", "GXKCaptureActionKeyPress"):
+            self.assertNotIn(action_owner, lang)
+
+    def test_language_images_keep_independent_storage_from_per_key_action_display(self):
+        for name in ("gGuardLangKey", "gLangNormalImage", "gLangHighlightedImage", "gLangSoftKeyDef"):
+            self.assertIn(name, self.source)
+        display = (ROOT / "dylib/action_key_display.h").read_text(encoding="utf-8")
+        for lang_storage in ("gLangNormalImage", "gLangHighlightedImage", "gLangSoftKeyDef"):
+            self.assertNotIn(lang_storage, display)
+        lang_guard = function_body(self.source, "static void gxk_lang_updateView(UIView *key) {")
+        for action_storage in ("GXKActionDisplayForKey", "gActionNormalImage", "gActionHighlightedImage"):
+            self.assertNotIn(action_storage, lang_guard)
+
+    def test_action_and_language_teardown_remain_separate_on_disappearance(self):
         gone = function_body(self.source, "static void gkx_viewWillDisappear(id self, SEL _cmd, BOOL animated) {")
-        self.assertIn("GXKClearFlashGrace()", gone)
-        self.assertLess(gone.index("GXKDetachActionKey()"), gone.index("GXKClearFlashGrace()"))
-
-    def test_expiry_arms_the_rebind_window_before_deciding_to_hand_back(self):
-        """宽限到点必须先续等待窗、再判要不要还键，否则判据永远是假。
-
-        日志 5：detach 那一刻 GXKClearRebindPending 已经清掉等待窗，4822 到点后
-        gxk_rebind_hold 必然为假，于是当场 updateView 还原生、守卫 own=0/grace=0
-        放行，笑脸一直留到下一次切页。
-        """
-        expire = function_body(self.source, "static void GXKExpireFlashGraceIfNeeded(void) {")
-        note = expire.index("if (!gEmojiSoftKeyView) GXKNoteRebindPending();")
-        self.assertLess(note, expire.index("!gxk_rebind_hold(expired)"))
-        self.assertLess(note, expire.index("updateView]"))
-
-    def test_expiry_does_not_hand_the_key_back_while_rebind_is_pending(self):
-        """宽限到点不能立刻还键：那一次 updateView 会把原生笑脸画回去。
-
-        日志 4 的 1.17 秒圆圈就是这段空档——9390 宽限到点还原生、9391 守卫放行、
-        补绑要等下一轮主队列才到。等待窗内改为继续拦，绑上或超时才还。
-        """
-        hold = function_body(self.source, "static BOOL gxk_rebind_hold(UIView *key) {")
-        self.assertIn("gxk_rebind_pending()", hold)
-        self.assertIn("GXKEmojiKeyID", hold)
-        # 等待窗只认「可见九键布局体里的表情键」，不会变成第二条归属。
-        self.assertIn("GXKNineKeyBodyForKey(key, gCurrentVC.view)", hold)
-        expire = function_body(self.source, "static void GXKExpireFlashGraceIfNeeded(void) {")
-        # 交还原生这一步必须被等待窗挡住，且挡在 updateView 之前。
-        self.assertIn("!gxk_rebind_hold(expired)", expire)
-        self.assertLess(expire.index("!gxk_rebind_hold(expired)"), expire.index("updateView]"))
-        # 到点后仍要补绑，不能只拦不绑。
-        self.assertIn("if (!gEmojiSoftKeyView) GXKScheduleActionKeyRebind();", expire)
-        # 等待窗必须有界：超过上限一律还键，绝不长期接管。
-        window = function_body(self.source, "static BOOL gxk_rebind_pending(void) {")
-        self.assertIn("gRebindWaitDeadline > 0", window)
-        self.assertIn("CFAbsoluteTimeGetCurrent() < gRebindWaitDeadline", window)
-        # 写入拦截与守卫都必须认这条等待窗，否则原生图还是能进图层。
-        guarded = function_body(self.source, "static UIView *GXKGuardedKeyForIcon(UIView *icon) {")
-        self.assertIn("gxk_rebind_pending()", guarded)
-        self.assertIn("gxk_rebind_hold(v)", guarded)
-        guard = function_body(self.source, "static void gxk_key_updateView(id self, SEL _cmd) {")
-        self.assertIn("!gxk_rebind_hold(key)", guard)
-        # 绑定成功即结束等待；失败撤键也立即结束，键不会被空白挡到过期。
-        update = function_body(self.source, "static void GXKUpdateActionKey(UIViewController *vc) {")
-        self.assertLess(update.index("gGuardKey = currentKey"), update.index("GXKClearRebindPending()"))
-        detach = function_body(self.source, "static void GXKDetachActionKey(void) {")
-        self.assertLess(detach.index("GXKClearRebindPending()"), detach.index("if (!gEmojiSoftKeyView && !gActionKeyButton"))
-        # 键盘撤走时窗口一并作废。
-        clear = function_body(self.source, "static void GXKClearFlashGrace(void) {")
-        self.assertIn("GXKClearRebindPending()", clear)
+        self.assertIn("GXKDetachActionKey()", gone)
+        self.assertIn("GXKDetachLangKey()", gone)
+        self.assertIn("gCurrentVC = nil", gone)
+        action = (ROOT / "dylib/action_key_display.h").read_text(encoding="utf-8")
+        detach = function_body(action, "static void GXKDetachActionKey(void)")
+        self.assertNotIn("GXKDetachLangKey", detach)
+        self.assertNotIn("gGuardLangKey = nil", detach)
 
 
 

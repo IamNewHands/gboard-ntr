@@ -84,6 +84,13 @@ class WorkflowContracts(unittest.TestCase):
     def setUpClass(cls):
         cls.text = WORKFLOW.read_text(encoding="utf-8")
 
+    def test_native_action_regression_gates_build_and_release(self):
+        self.assertIn("bash tests/native/run_tests.sh", self.text)
+        self.assertLess(self.text.index("bash tests/native/run_tests.sh"),
+                        self.text.index("- name: Build libgkx.dylib"))
+        self.assertNotIn("continue-on-error", self.text)
+        self.assertIn("needs: build", self.text)
+
     def test_publish_job_depends_on_build(self):
         self.assertIn("publish:", self.text)
         self.assertIn("needs: build", self.text)

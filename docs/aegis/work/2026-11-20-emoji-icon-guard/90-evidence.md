@@ -48,3 +48,51 @@
 - 全量回归：11 个测试文件逐个 `python -B <file>` 全 OK。
 - CI 验证：run 44740644479 success（build + publish 两个 job），publish 日志显示 `包内 libgkx.dylib 校验通过 (1 处)`、`published_at=2026-11-20T13:02:08Z`、资产 35980398 bytes。
 - 未覆盖：本次 dylib 内容与上一版相同（仅工作流与脚本变化），因此产物哈希未变；真正「换 dylib 后 Release 自动更新」的验证要等下一次改 `dylib/` 的提交。仍未真机验收。
+
+## 2026-11-22：第五版仍闪，重新核对原生显示生产链（本轮未出新包）
+
+- 用户当前验收：拼音↔123↔符号切页瞬间仍闪圆圈；文字应像原生一样连续，不切换/消失。新建 文本文档 (10).txt 是第五版反馈，307行环形缓冲；保留6次retarget和6次grce exp，约606–618ms到期，但用户确认症状在切页瞬间。不能据此把到期还键升级为直接原因。
+- 日志限制：没有UIView/model/icon/host/source-target身份、提交SHA或presentation帧；punct attach/detach是标点键计数，绝非动作键计数；gd/blk为0不证明没有绘制。过去按相同ID判断旧壳/未抓到update即无原生重画的解释撤回。
+- 当前基线main 4dc86035d88928b50af905232280282141e0b87a已经包含第五版。源码实证：未绑定键的native updateView先绘制而guard返回，文字靠后续异步动作刷新；唯一文字UIButton跨host迁移，不属于物理nativekey。可构造旧TouchDown后跨键retarget，TouchUp复核新身份仍通过；GXKKeepLiveBinding读取保存的旧actions而不是live新model。属于可复现源码机制，不是新方案真机零闪证明。
+
+### 原包固定事实与反证
+
+- 原始IPA SHA256 c011730153df537f226052e766bbbf71834b5afcfeb13cba12f365d049719731；原始appex SHA256 711bc3dbeaec7cce6551d48286a7e5322b460e78aaaafa580e2ccd7fafb86566，cryptid=0。只在项目_scratch提取分析，原包未改。
+- existing tools/objc_probe.py格式解析和类本地方法表核对：GKBSoftKeyView -updateView v16@0:8 VM0x10027ca3c；-setSoftKeyDef: v24@0:8@16 VM0x10027b944；GKBImageLayer -actionForKey: @24@0:8@16 VM0x100295d50，完整8字节 000080d2c0035fd6 = mov x0,#0; ret（下一方法VM0x100295d58）。方法恒返回nil。此前“实现actionForKey就会隐式淡出”的注释和强制测试是错误因果解释，已用原包断言替代。不能据此断言其他mask/presentation/显式动画不存在。
+- 原生initView VM0x10027c530顺序：内容addSubview VM0x10027c7e4→内容frame→initSubViewsIDs VM0x10027c81c→updateView VM0x10027c82c。此时key可能尚未属于控制器root。initSubViewsIDs VM0x10027c858–0x10027ca3c递归按restorationIdentifier建表；自有UILabel不占用label/image ID，也不写此表。
+- resetView VM0x10027c314–0x10027c518遍历native host全部subviews remove；hostView getter VM0x10027e17c–0x10027e1e0可返回self。原生layoutSublayersOfLayer VM0x10027b62c–0x10027b760使用hostView.subviews.firstObject当nativecontent。必须保留关联记录、在内容重建之后追加自有label，不能让label成为firstObject。
+- setSoftKeyDef分支：同layout先clearLabelAndIcons、存model、updateView；布局重建reset、存model、initView；同指针可早退。hook要在模型替换前撤输入世代，完成原生链后验证并同步自己的label。仅靠keymove无法覆盖祖先同window移动，需controller完成layout同步收口。
+- 工具覆盖：REA6.5.0 Windows adapter拒绝Mach-O（只接native PE/raw6502）；未修系统配置/安装engine。现有Ghidra12.1.4通过项目限定XDG_CONFIG_HOME/XDG_CACHE_HOME运行scoped headless Mach-O import，selected methods离线反汇编/反编译。证据是普通Ghidra原包分析，不伪标REA/MCP运行时证据。
+
+### 本轮验证进度（2026-11-22恢复阶段历史；当前读回见末尾）
+
+- 结构核验：aegis-workspace.py check --root D:/GitHub_Clone/gboard-ntr exit1，missing workspace directory: docs/aegis/adr；docs/aegis/baseline；docs/aegis/specs；docs/aegis/plans；missing workspace file: docs/aegis/README.md；docs/aegis/INDEX.md；docs/aegis/BASELINE-GOVERNANCE.md。项目当前采用既有轻量work载体，不为此bug扩建治理结构。ADR Gate hard-to-reverse=no，选择skip/轻记录；结构核验不证明语义或产物验收。
+
+- tests/test_native_resources.py原包资源+ABI/constant-nil反证：8项通过，2026-11-22 23:05前执行，exit0，无skip。验证原包身份/字节与模型签名，不验证新dylib或真机帧。
+- 正在实施：每物理key自有child UILabel + input-only transparent siblingbutton，native完成链同步reconcile；删除park/grace/rebind/stale-shell第二绘制归属。接续核验时生产仍是4170行旧实现、header缺失，不能把待实施设计说成已完成。已创建tests/native/ActionDisplayTests.m：23项same-TU生产UIKit用例，使用真实window/tree/hitTest/layer、仅fake原生模型接口；包含两host/native-first/reset/模型图标替换/触摸世代/空动作吞触摸/双可见key/return和26退出/三态/前景vs背景mask/离屏raster正负对照。Windows未执行UIKit。14项native-runner离线门禁及bash -n通过；这些结果仅证明离线门禁/接线，不验证新dylib或presentation。runner分别留xcodebuild exit-status.txt与最终final-exit-status.txt，门禁输出写verify-result.log并上传。计数仅适用于当前单fixture target；实际Xcode16 summary schema/真实运行仍需CI读回。
+- native-scaffold-audit静态审阅805行/23用例及Xcode工程/runner，无新确定编译阻断；未编译/未跑UIKit。highlighted仅setter/model，sendActions不是UITouch，controller直接C wrapper不是已安装swizzle集成；offscreen model-layer raster不是presentation。最终生产交叉检查待writer落盘。前驱Release v1.0已读回：2026-11-22T14:19:44Z，35991603 bytes，digest=sha256:da167ef815c87b1804167261072d442b08a5c698d7fdb15b8993b839b8ead19a，当前本地IPA一致；不是本轮新包。
+- 授权进展：2026-11-22 23:11用户明确批准回归通过后推送IamNewHands/gboard-ntr main→Actions arm64编译→覆盖既有v1.0安装包。尚未执行本轮生产编译、Simulator fixture、Remote CI、IPA、新真机首帧验收。任何源码/离线测试绿不等于用户零闪结果已实现。
+- 前景边界复核：GKBImageViewWithBackground backgroundLayer getter VM0x1002962e0 / @16@0:8，setter VM0x100296a24；backgroundImage/highlightedBackgroundImage setter VM0x10029643c / 0x1002964c4。getter返回类/懒创建未证实。GKBImageLayer currentLayerForImage VM0x100295e20–0x100296080可返回自身或新普通CALayer mask并复制delegate；因此delegate/superlayer不能授权抑制，只认当前native icon.layer指针。背景setter始终透传，不宣称截获普通mask直接contents或presentation。
+
+### 08:24读回（历史；复审修正见下）
+
+- 源码：dylib/gkx.m:625引入逐键owner；dylib/action_key_display.h:169-291同栈挂本key UILabel与透明sibling input；:174-181冷启动先弱登记，不提前授权显示/输入；:293-318捕获/取消/校验generation与强制当前树唯一性；:328-332离场逐键退役。原生model/idToViewDict不写，native-firstObject校验先于自有label添加。
+- Hooks：dylib/gkx.m:747-770保留真实void ABI、先native完成后reconcile；model变化先invalidate。:785-814仅目标class局部安装且检查参数编码。:1230-1235 toolbar样式从当前binding取，不再读旧全局；:1675同步controller完成layout收口，后续全树扫描仍合并异步。
+- 执行：一次8套必要回归138项全通过，0skip；31 action/7 diag/14 language/43 perf/8原包/14 runner/13 release/8 toolbar几何；bash -n和git diff --check exit0。Windows bundled Python，未安装本地原生工具链。
+- 凭据与发布：gh认证IamNewHands，origin=https://github.com/IamNewHands/gboard-ntr.git；remote main读回4dc86035d88928b50af905232280282141e0b87a。已有明确main→CI→既有v1.0覆盖授权，尚无本轮commit/push/new IPA。
+- Native当前26用例（tests/native/ActionDisplayTests.m，848行），不是恢复时23。未执行；XCTest/UI树、模型layer离屏raster、sendActions和wrapper均不能升级成真机presentation/UITouch/swizzle全链证明。
+- 继承误判已纠正：GKBImageLayer actionForKey恒nil，不能用“隐式淡出”解释闪烁；0.61s到期日志不对应用户切页瞬间；源码机制与已执行本地回归不等于实际零闪。工程交付结束后保留此真机验收缺口。
+
+### 复审修正与受影响验证（2026-11-23 08:48）
+
+- spec-review指出同key/body/root/session的alpha→0或移出root动画：模型先到终点，presentation仍可能可见；旧domain/Current误用GXKKeyIsVisible使label早退并恢复圆圈。这是源码反例，不是原生Gboard已命中链。
+- 修正唯一逐键owner：dylib/action_key_display.h:119-138结构current不读模型可见性；:189-195结构domain不按alpha/geometry退役；:203-206可见性只决定clickAllowed；:256-266可见→不可见取消held generation。原生前景setter仍只守exact-current icon+已准备label，背景/模型不写。
+- 仅扩展现有tests/test_action_key.py exact-icon契约与tests/native/ActionDisplayTests.m alpha/transform用例，native仍26项。0.3s动画块内检查model端点、reconcile前后label/图标守卫保持、旧TouchUp无输入；这是模型/UI树断言，不冒充presentation帧。
+- Windows修正后action契约31项exit0/0skip、git diff --check exit0；此前138项保持历史，未重复全套。08:54独立spec-review给spec pass，原唯一Important源码反例关闭，指定邻近边界无新阻断；结论仅静态证据。
+
+### 质量复审修正与定点验证（2026-11-23 09:24）
+
+- quality-review最终报告2项Important / Implementation Drift（scope: both）：TouchDown后同key.userInteractionEnabled=NO，旧TouchUp仍可执行；同key原生16pt标题在bounds缩至1×1时，fit混入contentReady使confirmed label退役并恢复原生图像。两者为源码seam反例，不是已观察Gboard真机根因。
+- dylib/action_key_display.h:203-204 clickAllowed现取native输入能力，:322-324 TouchUp再次复核，既有允许→不允许取消generation；display Current/domain不受交互能力影响，空actions覆盖按钮仍吞触摸。:211-218把native content结构ready与titleFits分开，未确认first admission仍要求fit，confirmed连续绑定不因临时bounds不足退役。缺内容/native return/26/拆树/session仍走原有退役。未改模型、字体、原生几何或language owner。
+- tests/native/ActionDisplayTests.m既有输入generation、missing-content/first-fit和alpha/transform用例扩展，仍26项/937行；检查无layout的disabled TouchUp、禁用后再启用不复活旧touch、bounds1×1模型端点label及exact-icon守卫保留、未确认小键不能首次准备。程序sendActions/model动画断言不是presentation/UITouch证明。
+- 09:24最新受影响tests/test_action_key.py 31项一次通过，exit0/0skip；git diff --check exit0。此前138结果保持历史，不重复全量、不叠加数字。业务源码343行header已冻结；09:29 spec-review定点spec pass，两项源码反例闭合、指定相邻valid case无削弱，09:36原quality-review最终定点复核通过：两项Important关闭、无新增Critical/Important/Minor；源码冻结状态可交既有CI。两审查均未执行测试，UIKit、arm64编译和新IPA尚待本轮CI，presentation/UITouch/真机未验证。

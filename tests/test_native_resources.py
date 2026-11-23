@@ -10,6 +10,9 @@ import struct
 import unittest
 import zipfile
 from pathlib import Path
+import importlib.util
+import io
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -179,6 +182,70 @@ class OriginalNativeResources(unittest.TestCase):
         font = nib.resolve(label["UIFont"])
         self.assertEqual(nib.resolve(font["UIFontName"]), "Roboto-Regular")
         self.assertEqual(font["UIFontPointSize"], 16.0)
+
+
+    def native_macho(self):
+        """Reuse the repository's format-aware probe over original ZIP bytes.
+
+        No extracted fixture, live process, emulator, or disassembler is involved.
+        The in-memory open shim supplies the exact bytes to MachO's existing reader.
+        """
+        raw = self.archive.read("Payload/Gboard.app/PlugIns/Gboard.appex/Gboard")
+        self.assertEqual(hashlib.sha256(raw).hexdigest(),
+                         "711bc3dbeaec7cce6551d48286a7e5322b460e78aaaafa580e2ccd7fafb86566")
+        spec = importlib.util.spec_from_file_location("gxk_objc_probe", ROOT / "tools/objc_probe.py")
+        probe = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(probe)
+        with patch("builtins.open", return_value=io.BytesIO(raw)):
+            return probe.MachO("original-appex-in-memory")
+
+    def native_imp(self, macho, class_name, selector):
+        """Resolve a pinned class-local, absolute Objective-C method entry."""
+        for section in ("__DATA_CONST,__objc_classlist", "__DATA,__objc_classlist"):
+            if section not in macho.segs:
+                continue
+            _, size, offset = macho.segs[section]
+            for index in range(size // 8):
+                cls = struct.unpack_from("<Q", macho.d, offset + index * 8)[0]
+                if not cls:
+                    continue
+                ro = macho.u64(cls + 32) & ~7
+                if macho.cstr(macho.u64(ro + 24)) != class_name:
+                    continue
+                methods = macho.u64(ro + 32)
+                flags, count = macho.u32(methods), macho.u32(methods + 4)
+                self.assertFalse(flags & 0x80000000, "Pinned fixture changed to relative methods")
+                entry_size = flags & 0xFFFF
+                self.assertEqual(entry_size, 24, "Pinned arm64 absolute method layout changed")
+                self.assertLess(count, 500)
+                for method in range(count):
+                    entry = methods + 8 + method * entry_size
+                    if macho.cstr(macho.u64(entry)) == selector:
+                        return macho.u64(entry + 16)
+        self.fail(f"Missing pinned class-local method: -[{class_name} {selector}]")
+
+    def test_native_image_layer_action_for_key_is_constant_nil_not_a_fade(self):
+        """A selector's existence does not prove implicit animation.
+
+        These are the complete pinned function's two ARM64 instructions:
+        mov x0,#0; ret. This rejects the old 'actionForKey exists => fades' claim,
+        not every possible animation in the actual Gboard presentation tree.
+        """
+        macho = self.native_macho()
+        self.assertEqual(dict(macho.classes()["GKBImageLayer"][0])["actionForKey:"], "@24@0:8@16")
+        imp = self.native_imp(macho, "GKBImageLayer", "actionForKey:")
+        self.assertEqual(imp, 0x100295D50)
+        offset = macho.vm2off(imp)
+        self.assertIsNotNone(offset)
+        self.assertEqual(macho.d[offset:offset + 8], bytes.fromhex("000080d2c0035fd6"))
+
+    def test_native_key_update_and_model_setter_have_verified_void_abi(self):
+        macho = self.native_macho()
+        methods = dict(macho.classes()["GKBSoftKeyView"][0])
+        self.assertEqual(methods["updateView"], "v16@0:8")
+        self.assertEqual(methods["setSoftKeyDef:"], "v24@0:8@16")
+        self.assertEqual(self.native_imp(macho, "GKBSoftKeyView", "updateView"), 0x10027CA3C)
+        self.assertEqual(self.native_imp(macho, "GKBSoftKeyView", "setSoftKeyDef:"), 0x10027B944)
 
 
 if __name__ == "__main__":

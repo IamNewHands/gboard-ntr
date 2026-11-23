@@ -29,6 +29,7 @@ class ActionKeySourceContracts(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.source = SOURCE.read_text(encoding="utf-8")
+        cls.display = (ROOT / "dylib/action_key_display.h").read_text(encoding="utf-8")
         cls.native_style = (ROOT / "dylib/native_key_style.h").read_text(encoding="utf-8")
 
     def test_newline_is_a_newline_not_backslash_n(self):
@@ -56,13 +57,6 @@ class ActionKeySourceContracts(unittest.TestCase):
         self.assertIn("gOrigViewDidLayoutSubviews", layout)
         self.assertIn("GXKUpdateActionKey", layout)
 
-    def test_tap_revalidates_sender_identity_and_binding(self):
-        tap = function_body(self.source, "- (void)onActionKeyTapped:(UIButton *)sender {")
-        self.assertIn("sender != gActionKeyButton", tap)
-        self.assertIn("GXKFindNineKeyEmojiKey", tap)
-        self.assertIn("softKeyDef", tap)
-        self.assertIn("gActionSoftKeyDef", tap)
-
     def test_tap_three_states_clear_newline_dismiss(self):
         """组字「重输」、联想「收起」、其余「换行」；收起走公开 dismissKeyboard。"""
         tap = function_body(self.source, "- (void)onActionKeyTapped:(UIButton *)sender {")
@@ -88,16 +82,6 @@ class ActionKeySourceContracts(unittest.TestCase):
         self.assertIn("gSuggestingActive = NO", cached)
         gone = function_body(self.source, "static void gkx_viewWillDisappear(id self, SEL _cmd, BOOL animated)")
         self.assertIn("gSuggestingActive = NO", gone)
-
-    def test_native_keycap_is_not_hidden_or_repainted(self):
-        # 只扫动作键那一段：设置页的 toast 有自己的圆角，不属于键帽外观。
-        start = self.source.index("#pragma mark - 动作键目标与更新")
-        end = self.source.index("#pragma mark - 主 App：常用语维护入口")
-        action = self.source[start:end]
-        for retired in ("GXKRestoreKeySubviews", "sub.hidden = YES", "sub.hidden = NO", "cornerRadius", "colorWithWhite:0.35", "colorWithRed:0.82", "userInterfaceStyle"):
-            self.assertNotIn(retired, action)
-        update = function_body(self.source, "static void GXKUpdateActionKey(UIViewController *vc) {")
-        self.assertIn("[UIColor clearColor]", update)
 
     def test_keyboard_touch_methods_are_not_swizzled(self):
         initialization = function_body(self.source, "static void gkx_init(void)")
@@ -134,45 +118,6 @@ class ActionKeySourceContracts(unittest.TestCase):
         self.assertNotIn("clearLabelAndIcons", self.source)
         self.assertIsNone(re.search(r"softKeyDef\s*=(?!=)", self.source), "Native softKeyDef must remain read-only")
 
-    def test_saved_foregrounds_are_restricted_to_same_native_identity(self):
-        detach = function_body(self.source, "static void GXKDetachActionKey(void)")
-        identity = detach.index("oldKey.restorationIdentifier")
-        normal_restore = detach.index("oldIcon.image = normalImage")
-        highlight_restore = detach.index("oldIcon.highlightedImage = highlightedImage")
-        self.assertLess(identity, normal_restore)
-        self.assertLess(identity, highlight_restore)
-        self.assertIn("softKeyDef == oldModel", detach)
-        self.assertIn("GXKNativeIconForKey(oldKey) == oldIcon", detach)
-        self.assertIn("oldKey.hidden = wasHidden", detach)
-        self.assertIn("gActionNormalImage = nil", detach)
-        # 归属只活到撤键结束：撤键后这把键完全回到原生，守卫不再清它的前景。
-        # 且必须先释放归属再调原生 updateView——那次重画是还原，不能被守卫再搬走一次。
-        self.assertIn("gGuardKey = nil", detach)
-        self.assertLess(detach.index("gGuardKey = nil"),
-                        detach.index("[(id<GXKNativeSoftKeyContent>)oldKey updateView]"))
-        self.assertIn("gActionHighlightedImage = nil", detach)
-
-    def test_rebinding_creates_fresh_button_after_detaching(self):
-        update = function_body(self.source, "static void GXKUpdateActionKey(UIViewController *vc) {")
-        create = update.index("[UIButton buttonWithType:UIButtonTypeCustom]")
-        self.assertLess(update.index("GXKDetachActionKey();", update.index("gEmojiSoftKeyView != currentKey")), create)
-        self.assertIn("gActionSoftKeyDef != model", update)
-        self.assertIn("gActionKeyButton.superview != host", update)
-        self.assertIn("GXKActionHostForKey(currentKey)", update)
-        self.assertNotIn("[currentKey addSubview:btn]", update)
-        self.assertIn("[currentKey convertRect:currentKey.bounds toView:host]", update)
-        self.assertIn("gUpdatingActionKey", update)
-
-    def test_native_theme_and_both_titles_keep_same_transparent_style(self):
-        update = function_body(self.source, "static void GXKUpdateActionKey(UIViewController *vc) {")
-        self.assertIn("icon.foregroundColor", update)
-        self.assertIn("GXKNativeActionFont", update)
-        self.assertIn("setTitleColor:color forState:UIControlStateNormal", update)
-        self.assertIn("setTitleColor:color forState:UIControlStateHighlighted", update)
-        self.assertIn("btn.accessibilityLabel = title", update)
-        self.assertNotRegex(update, r"(?:currentKey|icon|root)\.(?:frame|bounds|backgroundColor)\s*=")
-        self.assertNotIn("backgroundLayer", re.sub(r"//[^\n]*", "", update))
-
     def test_mixed_peer_bodies_fail_closed_but_nested_fixed_body_is_not_a_peer(self):
         finder = function_body(self.source, "static UIView *GXKFindNineKeyEmojiKey(UIView *root)")
         self.assertIn("GKB9KeysSoftKeyboardView", finder)
@@ -184,97 +129,6 @@ class ActionKeySourceContracts(unittest.TestCase):
         self.assertIn("![visibleBody isKindOfClass:nineClass]", finder)
         self.assertIn("GXKNineKeyBodyForKey(candidate, root) != visibleBody", finder)
 
-    def test_rebinding_rescans_controller_root_and_key_after_native_refresh(self):
-        update = function_body(self.source, "static void GXKUpdateActionKey(UIViewController *vc) {")
-        rebind = update[update.index("gEmojiSoftKeyView != currentKey"):]
-        detach = rebind.index("GXKDetachActionKey();")
-        controller = rebind.index("vc != gCurrentVC || !vc.isViewLoaded || vc.view != root", detach)
-        select = rebind.index("currentKey = GXKFindNineKeyEmojiKey(root)", controller)
-        content = rebind.index("icon = GXKNativeIconForKey(currentKey)", select)
-        create = rebind.index("[UIButton buttonWithType:UIButtonTypeCustom]", content)
-        self.assertLess(detach, controller)
-        self.assertLess(controller, select)
-        self.assertLess(select, content)
-        self.assertLess(content, create)
-
-    def test_empty_native_model_is_rejected_on_updates_and_taps(self):
-        predicate = function_body(self.source, "static BOOL GXKModelHasNativeActions(id model)")
-        self.assertIn("respondsToSelector:@selector(actionsArray)", predicate)
-        self.assertIn("isKindOfClass:[NSArray class]", predicate)
-        self.assertIn("actions.count > 0", predicate)
-        self.assertNotIn("setActions", predicate)
-        tap = function_body(self.source, "- (void)onActionKeyTapped:(UIButton *)sender {")
-        update = function_body(self.source, "static void GXKUpdateActionKey(UIViewController *vc) {")
-        self.assertIn("!GXKModelHasNativeActions(gActionSoftKeyDef)", tap)
-        self.assertGreaterEqual(update.count("!GXKModelHasNativeActions(model)"), 2)
-
-    def test_fresh_binding_uses_live_key_not_previous_images(self):
-        """绑定判据只看当前键/模型/前景色，绝不用上一次存下来的图授权。
-
-        前景图本身不能当前提：写入拦截上线后被守卫的键前景恒为空，
-        再要求「必须有原生前景」会让切页后的新键永远绑不上。
-        """
-        update = function_body(self.source, "static void GXKUpdateActionKey(UIViewController *vc) {")
-        fresh = update[update.index("gEmojiSoftKeyView != currentKey"):update.index("[UIButton buttonWithType:UIButtonTypeCustom]")]
-        self.assertIn("GXKFindNineKeyEmojiKey(root)", fresh)
-        self.assertIn("GXKNativeIconForKey(currentKey)", fresh)
-        self.assertIn("!GXKModelHasNativeActions(model)", fresh)
-        self.assertNotIn("hasForeground", fresh)
-        self.assertNotIn("icon.image", fresh)
-        self.assertNotIn("icon.highlightedImage", fresh)
-        self.assertNotIn("gActionNormalImage", fresh)
-        self.assertNotIn("gActionHighlightedImage", fresh)
-
-    def test_foreground_writes_are_blocked_at_the_setter_not_after_the_fact(self):
-        """事后清图救不了闪圈：原生那一拍已经把图交给渲染服务。
-
-        真正的修法是在写入点拦：守卫归属中或刚撤键的宽限窗口里，非空前景不进图层；
-        置空必须放行，否则我们自己也没法把图撤下来。
-        """
-        helper = function_body(self.source, "static UIView *GXKGuardedKeyForIcon(UIView *icon) {")
-        self.assertIn('GXKClassCached(@"GKBSoftKeyView", &gCachedKeyClass)', helper)
-        self.assertIn("v == gGuardKey", helper)
-        self.assertIn("v == gGuardLangKey", helper)
-        self.assertIn("gxk_flash_grace_active(v)", helper)
-
-        image = function_body(self.source, "static void gxk_icon_setImage(id self, SEL _cmd, UIImage *image) {")
-        # 只有非空写入才拦；置空放行给原生，撤图仍走原生路径。
-        self.assertIn("UIView *key = image ? GXKGuardedKeyForIcon((UIView *)self) : nil;", image)
-        self.assertIn("if (key) {", image)
-        self.assertIn("return;", image)
-        self.assertIn("gOrigIconSetImage(self, _cmd, image)", image)
-        # 拦下来的图必须存档：撤键那一刻要靠它把原生笑脸写回去。
-        self.assertIn("gActionNormalImage = image;", image)
-
-        highlighted = function_body(
-            self.source, "static void gxk_icon_setHighlightedImage(id self, SEL _cmd, UIImage *image) {")
-        self.assertIn("UIView *key = image ? GXKGuardedKeyForIcon((UIView *)self) : nil;", highlighted)
-        self.assertIn("gOrigIconSetHighlightedImage(self, _cmd, image)", highlighted)
-        self.assertIn("gActionHighlightedImage = image;", highlighted)
-
-        # 我们自己还原时走旁路，否则写回去的图会被自己的拦截吃掉，键空白到宽限结束。
-        self.assertIn("static BOOL gxk_icon_write_bypass = NO;", self.source)
-        self.assertIn("if (gxk_icon_write_bypass) return nil;", helper)
-
-        install = function_body(self.source, "static BOOL GXKInstallIconWriteBlock(void) {")
-        self.assertIn('NSClassFromString(@"GKBImageViewWithBackground")', install)
-        for setter in ("setImage:", "setHighlightedImage:",
-                       "setBackgroundImage:", "setHighlightedBackgroundImage:"):
-            self.assertIn("@selector(%s)" % setter, install)
-        self.assertIn("method_setImplementation(m, setters[i].imp);", install)
-        # 两个类都可能晚加载：只要挂上了任意一个就记账，全都没挂就保持 NO 下次再来。
-        self.assertIn("gxk_icon_block_hooked = hooked;", install)
-        self.assertIn("return hooked;", install)
-        # 只换类自己的实现：对继承来的方法调 method_setImplementation 会改写父类，
-        # 等于给整机所有 UIImageView 装上拦截。
-        self.assertIn("GXKClassImplementsSelector(cls, setters[i].sel)", install)
-        # 图层那一路也要堵：原生可以直接写 GKBImageLayer，绕过视图 setter。
-        self.assertIn('NSClassFromString(@"GKBImageLayer")', install)
-        self.assertIn("gxk_layer_setImage", install)
-        # 类晚加载时随 updateView 守卫一起补挂。
-        guard_install = function_body(self.source, "static void GXKInstallIconWriteGuard(void) {")
-        self.assertIn("GXKInstallIconWriteBlock();", guard_install)
-
     def test_action_and_toolbar_fonts_share_identified_native_key_owner(self):
         self.assertIn('#import "native_key_style.h"', self.source)
         font = function_body(self.source, "static UIFont *GXKNativeActionFont(")
@@ -285,93 +139,6 @@ class ActionKeySourceContracts(unittest.TestCase):
         self.assertIn("GXKNativeKeyStyleLabel(body, root)", toolbar)
         self.assertIn("label.font ?: GXKNativeKeyFont(body, root)", toolbar)
         self.assertNotIn("arrayWithObject:", toolbar)
-
-    def test_stale_foreground_is_cleared_before_any_structural_early_return(self):
-        """清理必须排在所有早退之前，否则陈旧笑脸会留在图层里，撤按钮那一帧露出来。
-
-        视频取证：每次切页恰好一帧原生笑脸（帧 128 换行 → 129 圆圈 → 130 换行）。
-        原因是模型被换成「换行」后 GXKModelHasNativeActions 为假、切页那一拍九键
-        布局体也已换掉，守卫在这些早退处返回，笑脸就留在图层上靠覆盖按钮遮着；
-        GXKDetachActionKey 摘按钮的那一帧它就上屏。
-        """
-        guard = function_body(self.source, "static void gxk_key_updateView(id self, SEL _cmd) {")
-        clear = guard.index("GXKClearIconImages(icon)")
-        # 刚撤键的那一把必须绕过布局判据：撤键末尾的还原 updateView 正好撞上切页，
-        # 九键布局体已经换掉，要求它在可见体里就等于放行那一帧笑脸。
-        self.assertIn("BOOL justDetached = (key == gFlashKey) && gxk_flash_grace_active(key);", guard)
-        self.assertLess(guard.index("justDetached"), guard.index("GXKNineKeyBodyForKey(key, gCurrentVC.view)"))
-        # 放宽只给这一把：别的键仍要求可见九键体与同窗口。
-        self.assertLess(guard.index("GXKNineKeyBodyForKey(key, gCurrentVC.view)"), clear)
-        self.assertLess(guard.index("key.window != gCurrentVC.view.window"), clear)
-        # 归属与键 ID 判据仍在最前：不是我们的键一律不碰。
-        for earlier in ("key != gGuardKey", "isEqualToString:GXKEmojiKeyID]"):
-            self.assertLess(guard.index(earlier), clear, earlier)
-        # 模型已是「换行」/「收起」时不清：那是正确内容，清掉会让键空一帧。
-        self.assertLess(guard.index("GXKModelHasNativeActions(((id<GXKNativeSoftKeyContent>)key).softKeyDef)"), clear)
-
-    def test_detach_clears_stale_foreground_before_removing_overlay_button(self):
-        """摘按钮之前必须先清陈旧前景：按钮是遮住笑脸的唯一东西。"""
-        detach = function_body(self.source, "static void GXKDetachActionKey(void) {")
-        # 必须现取图层上的那一个 icon：切页这一拍原生会重建 icon，存档的旧对象已经不在图层上。
-        self.assertIn("GXKNativeIconForKey(oldKey)", detach)
-        self.assertIn("GXKClearIconImages(staleIcon)", detach)
-        self.assertLess(detach.index("GXKClearIconImages(staleIcon)"),
-                        detach.index("[oldButton removeFromSuperview]"))
-
-    def test_native_icon_write_guard_clears_only_the_bound_key_in_the_same_pass(self):
-        """原生 updateView 写完的同一轮清前景，否则下一拍清除前会闪一帧圆圈。"""
-        guard = function_body(self.source, "static void gxk_key_updateView(id self, SEL _cmd) {")
-        # 原方法是 void（v16@0:8）。包装必须同签名：按 id 接管会让 ARC retain 一个
-        # 从未被赋值的返回寄存器，切键盘当场闪退。
-        self.assertIn("static void (*gOrigKeyUpdateView)(id, SEL);", self.source)
-        self.assertNotIn("return result;", guard)
-        self.assertIn("if (gOrigKeyUpdateView) gOrigKeyUpdateView(self, _cmd);", guard)
-        # 判据挂在「归属的九键表情键」上，不能挂按钮/图标对象同一性：切页这一拍原生会
-        # 重建 icon，detach 又会先把按钮撤走，旧判据在这两种情况下都放行、笑脸照原样提交一帧。
-        self.assertIn("key != gGuardKey", guard)
-        self.assertIn("GXKNineKeyBodyForKey(key, gCurrentVC.view)", guard)
-        self.assertNotIn("key != gEmojiSoftKeyView", guard)
-        self.assertNotIn("icon != gActionNativeIcon", guard)
-        self.assertNotIn("!gActionKeyButton", guard)
-        # 图标必须每次现取：守卫里缓存的那一个在切页后已经不是图层上的那一个。
-        self.assertLess(guard.index("GXKNativeIconForKey(key)"), guard.index("GXKClearIconImages(icon)"))
-        # 原生重画的图要先存档再清，撤键时才还原得回来。
-        self.assertLess(guard.index("gActionNormalImage = icon.image"), guard.index("GXKClearIconImages(icon)"))
-        self.assertLess(guard.index("gActionHighlightedImage = icon.highlightedImage"),
-                        guard.index("GXKClearIconImages(icon)"))
-        # 清图必须瞬时：GKBImageLayer 实现了 actionForKey:，普通赋值会走隐式动画，
-        # 前景图淡出那几帧就是用户看到的「闪一下圆圈」。
-        clear = function_body(self.source, "static void GXKClearIconImages(UIView<GXKNativeIconContent> *icon) {")
-        self.assertIn("[CATransaction begin]", clear)
-        self.assertIn("[CATransaction setDisableActions:YES]", clear)
-        self.assertIn("[CATransaction commit]", clear)
-        self.assertLess(clear.index("setDisableActions:YES"), clear.index("icon.image = nil"))
-        # 不碰键帽外观：不隐藏、不透明、不改背景层。
-        for retired in ("hidden", "alpha", "backgroundLayer", "backgroundColor", "cornerRadius"):
-            self.assertNotIn(retired, guard)
-
-        install = function_body(self.source, "static void GXKInstallIconWriteGuard(void) {")
-        self.assertIn("if (gxk_icon_guard_hooked) return;", install)
-        self.assertIn('NSClassFromString(@"GKBSoftKeyView")', install)
-        self.assertIn("class_getInstanceMethod(cls, @selector(updateView))", install)
-        # 签名不符就不挂：宁可闪一帧，也不能让键盘崩。
-        self.assertIn("const char *types = method_getTypeEncoding(m);", install)
-        self.assertIn("if (!types || types[0] != 'v') return;", install)
-        self.assertIn("method_getImplementation(m)", install)
-        # 方法来自父类时用 class_addMethod，别改写父类波及其它键。
-        self.assertIn("if (!class_addMethod(cls, @selector(updateView), (IMP)gxk_key_updateView, types)) {", install)
-        self.assertIn("method_setImplementation(m, (IMP)gxk_key_updateView);", install)
-        self.assertIn("gxk_icon_guard_hooked = YES;", install)
-
-        # 构造期先挂，类晚加载时 viewWillAppear 补挂。
-        init = function_body(self.source, "static void gkx_init(void)")
-        self.assertIn("GXKInstallIconWriteGuard();", init)
-        self.assertLess(init.index("GXKInstallIconWriteGuard();"),
-                        init.index("GXKApplyTelemetryBlockIfNeeded()"))
-        appear = function_body(self.source, "static void gkx_viewWillAppear(id self, SEL _cmd, BOOL animated)")
-        self.assertIn("GXKInstallIconWriteGuard();", appear)
-        self.assertLess(appear.index("GXKSymbolInstallHooks()"),
-                        appear.index("GXKInstallIconWriteGuard();"))
 
     def test_native_typography_owner_is_return_key_dictionary_label_not_candidate(self):
         label = function_body(self.native_style, "static UILabel *GXKNativeReturnLabel(")
@@ -411,29 +178,6 @@ class ActionKeySourceContracts(unittest.TestCase):
         for binding in ("gNativeStyleBody = nil;", "gNativeStyleKey = nil;", "gNativeStyleLabel = nil;", "gNativeStyleScanAt = 0;"):
             self.assertIn(binding, reset)
 
-    def test_both_action_update_paths_resample_native_font_and_keep_both_titles(self):
-        update = function_body(self.source, "static void GXKUpdateActionKey(UIViewController *vc) {")
-        fast, full = update.split("UIView *currentKey = GXKFindNineKeyEmojiKey(root);", 1)
-        self.assertIn("GXKNativeActionFont(gEmojiSoftKeyView, root)", fast)
-        self.assertIn("cheapBtn.titleLabel.font = cheapFont", fast)
-        self.assertIn("GXKNativeActionFont(currentKey, root)", full)
-        self.assertIn("btn.titleLabel.font = font", full)
-        for body, variable in ((fast, "cheapTitle"), (full, "title")):
-            self.assertIn(f"NSString *{variable} = GXKActionTitle(vc);", body)
-            self.assertIn(f"setTitle:{variable} forState:UIControlStateNormal", body)
-            self.assertIn(f"setTitle:{variable} forState:UIControlStateHighlighted", body)
-        # 标题三态必须集中在一个函数里，两个更新路径不得各自复制判定逻辑。
-        title = function_body(self.source, "static NSString *GXKActionTitle(UIViewController *vc) {")
-        self.assertIn('return @"重输";', title)
-        self.assertIn('return @"收起";', title)
-        self.assertIn('return @"换行";', title)
-        # 组字优先于联想：正在打的拼音不能被「收起」抢走。
-        self.assertLess(title.index('return @"重输";'), title.index('gSuggestingActive'))
-        sync = function_body(self.source, "static void GXKSyncToolbarStyle(")
-        self.assertIn("GXKToolbarTextStyle(body, &font)", sync)
-        self.assertIn("button.titleLabel.font = font", sync)
-        self.assertIn("setTitleColor:tint forState:UIControlStateNormal", sync)
-
     def test_queued_updates_are_bound_to_original_controller(self):
         tap = function_body(self.source, "- (void)onActionKeyTapped:(UIButton *)sender {")
         changed = function_body(self.source, "static void gkx_textDidChange(id self, SEL _cmd, id textInput)")
@@ -442,29 +186,160 @@ class ActionKeySourceContracts(unittest.TestCase):
         self.assertIn("UIViewController *vc = weakVC", changed)
         self.assertIn("vc == gCurrentVC", changed)
 
-    def test_grace_covers_rebuilt_key_and_detach_never_repaints_a_visible_key(self):
-        """宽限要盖住「切页后重建的新实例」，撤键不得把笑脸写回仍可见的键。
+    def test_per_native_key_binding_owns_visual_and_input_separately(self):
+        self.assertIn("@interface GXKActionDisplayBinding", self.display)
+        for owner in ("UILabel *label", "UIButton *inputButton", "UIView *key"):
+            self.assertIn(owner, self.display)
+        self.assertIn("objc_getAssociatedObject", self.display)
+        self.assertIn("objc_setAssociatedObject", self.display)
+        self.assertIn("GXKActionDisplayForKey", self.display)
+        self.assertNotIn("gActionKeyButton", self.source + self.display)
 
-        日志 6 取证：每次切页都是 det emoji → blk img（原生重画被拦）→ 3 毫秒后
-        hit new key，而屏幕上仍然露出那一帧笑脸。两条同时成立：
-        1. 新实例还没落进可解析的九键布局体，旧判据只认布局体，于是新键没人拦；
-        2. 撤键末尾把存档的笑脸写回旧键，而按钮刚在上面被摘走，写回的正是那一帧。
-        """
-        grace = function_body(self.source, "static BOOL gxk_flash_grace_active(UIView *key) {")
-        # 布局体判据仍在（正常路径优先），但不再是唯一出路：布局体换了的时候还要认可见性。
-        self.assertLess(grace.index("GXKNineKeyBodyForKey(key, gCurrentVC.view) != nil"),
-                        grace.index("GXKKeyIsVisible(key, gCurrentVC.view)"))
-        self.assertIn("return [key isDescendantOfView:gCurrentVC.view] && GXKKeyIsVisible(key, gCurrentVC.view);",
-                      grace)
-        detach = function_body(self.source, "static void GXKDetachActionKey(void) {")
-        # 还原只给已经不在屏幕上的旧键：可见的键写回笑脸，露出来的就是那一帧。
-        self.assertIn("BOOL offscreen = (oldKey.window == nil) || oldKey.isHidden;", detach)
-        self.assertLess(detach.index("BOOL offscreen"), detach.index("oldIcon.image = normalImage"))
-        self.assertLess(detach.index("if (offscreen &&"),
-                        detach.index("oldIcon.image = normalImage"))
-        # 按钮必须先摘、还原必须留到最后：反过来就是「先把笑脸写回、再撤遮挡」。
-        self.assertLess(detach.index("GXKClearIconImages(staleIcon)"),
-                        detach.index("[oldButton removeFromSuperview]"))
+    def test_native_key_is_weakly_registered_before_controller_readiness(self):
+        reconcile = function_body(self.display, "static void GXKReconcileActionDisplay(UIView *key)")
+        self.assertIn("[NSHashTable weakObjectsHashTable]", reconcile)
+        self.assertLess(reconcile.index("[gActionDisplayKeys addObject:key]"),
+                        reconcile.index("if (!domain)"))
+        self.assertLess(reconcile.index("GXKEmojiKeyID"),
+                        reconcile.index("[gActionDisplayKeys addObject:key]"))
+        self.assertLess(reconcile.index("[key isKindOfClass:keyClass]"),
+                        reconcile.index("[gActionDisplayKeys addObject:key]"))
+        self.assertNotIn("GXKClearRebindPending", self.source + self.display)
+
+    def test_no_cross_page_button_parking_grace_or_retarget_owner(self):
+        for retired in ("GXK_FLASH_GRACE_SECONDS", "GXK_PARK_SECONDS", "GXK_REBIND_WAIT_SECONDS",
+                        "gFlashKey", "gParkedButton", "gRebindWaitDeadline", "GXKTakeParkedButton",
+                        "GXKKeepLiveBinding", "gxk_stale_emoji_key", "canRetarget", "retarget %@"):
+            self.assertNotIn(retired, self.source + self.display)
+        for callback in ("GXKReconcileActionDisplay", "GXKActionDisplayCoversIcon"):
+            self.assertIn(callback, self.display)
+
+    def test_input_requires_touch_down_generation_and_live_tap_validation(self):
+        for required in ("capturedGeneration", "generation", "GXKCaptureActionKeyPress",
+                         "GXKCancelActionKeyPress", "GXKValidateActionKeyPress", "cancelTrackingWithEvent:"):
+            self.assertIn(required, self.display)
+        validate = function_body(self.display, "static GXKActionDisplayBinding *GXKValidateActionKeyPress(")
+        self.assertIn("capturedGeneration", validate)
+        self.assertIn("generation", validate)
+        self.assertIn("GXKFindNineKeyEmojiKey", validate)
+        self.assertIn("GXKModelHasNativeActions", validate)
+        self.assertIn("binding.key.userInteractionEnabled", validate)
+        tap = function_body(self.source, "- (void)onActionKeyTapped:(UIButton *)sender {")
+        self.assertLess(tap.index("GXKValidateActionKeyPress"), tap.index("GXKRefreshComposingState"))
+
+    def test_label_is_noninteractive_and_not_a_native_content_identity(self):
+        self.assertIn("userInteractionEnabled = NO", self.display)
+        self.assertIn("[UILabel", self.display)
+        self.assertNotRegex(self.display, r"(?:label|inputButton)\.restorationIdentifier\s*=\s*(?:GXKEmojiKeyID|@\"(?:image|label)\")")
+        self.assertNotRegex(self.display, r"idToViewDict\s*\[.*?\]\s*=")
+        self.assertNotRegex(self.source + self.display, r"\.softKeyDef\s*=(?!=)")
+
+    def test_native_first_content_order_is_verified_before_label_is_attached(self):
+        self.assertIn("nativeContent", self.display)
+        self.assertIn("nativeHost", self.display)
+        self.assertIn("firstObject", self.display)
+        self.assertIn("GXKNativeIconForKey", self.display)
+        self.assertIn("prepared", self.display)
+        # Runtime reset/remount/native-firstObject assertions live in the UIKit fixture.
+        fixture = ROOT / "tests/native/ActionDisplayTests.m"
+        self.assertTrue(fixture.is_file())
+
+    def test_coverage_is_exact_live_icon_and_an_attached_prepared_label(self):
+        coverage = function_body(self.display, "static BOOL GXKActionDisplayCoversIcon(")
+        for required in ("GXKActionDisplayForKey", "prepared", "label", "icon"):
+            self.assertIn(required, coverage)
+        self.assertIn("superview", coverage)
+        self.assertNotIn("gGuardKey", coverage)
+        self.assertNotIn("CFAbsoluteTimeGetCurrent", coverage)
+        guard = function_body(self.source, "static UIView *GXKGuardedKeyForIcon(")
+        self.assertIn("GXKActionDisplayCoversIcon", guard)
+        self.assertIn("gGuardLangKey", guard)
+        self.assertIn("gxk_icon_write_bypass", guard)
+        current = function_body(self.display, "static BOOL GXKActionDisplayIsCurrent(")
+        self.assertIn("isDescendantOfView:binding.root", current)
+        self.assertIn("key.window != binding.root.window", current)
+        self.assertNotIn("GXKKeyIsVisible", current, "Model visibility cannot retire an animating display owner")
+        self.assertNotIn("userInteractionEnabled", current, "Native input capability cannot retire display ownership")
+        reconcile = function_body(self.display, "static void GXKReconcileActionDisplay(")
+        domain = reconcile[reconcile.index("BOOL domain"):reconcile.index("if (!domain)")]
+        self.assertNotIn("GXKKeyIsVisible", domain)
+        self.assertNotIn("userInteractionEnabled", domain)
+        self.assertIn("BOOL clickAllowed = actions && key.userInteractionEnabled", reconcile)
+        self.assertIn("GXKKeyIsVisible(key, root) && GXKKeyIsVisible(body, root)", reconcile)
+        readiness = reconcile[reconcile.index("BOOL contentReady"):reconcile.index("BOOL titleFits")]
+        self.assertNotIn("textSize", readiness, "Model bounds fit is not native structural readiness")
+        self.assertIn("(!continuity && !titleFits)", reconcile)
+        self.assertIn("binding.clickAllowed = clickAllowed", reconcile)
+        self.assertIn("binding.clickAllowed && !clickAllowed", reconcile)
+
+    def test_native_completed_update_reconciles_same_key_without_a_queue_handoff(self):
+        guard = function_body(self.source, "static void gxk_key_updateView(id self, SEL _cmd)")
+        self.assertIn("gOrigKeyUpdateView", guard)
+        self.assertIn("GXKReconcileActionDisplay", guard)
+        self.assertLess(guard.index("gOrigKeyUpdateView(self, _cmd)"), guard.rindex("GXKReconcileActionDisplay"))
+        self.assertNotIn("dispatch_async", guard)
+        self.assertNotIn("dispatch_after", guard)
+        self.assertNotIn("return result;", guard)
+        self.assertIn("static void (*gOrigKeyUpdateView)(id, SEL)", self.source)
+
+    def test_completed_controller_layout_updates_action_display_before_async_work(self):
+        layout = function_body(self.source, "static void gkx_viewDidLayoutSubviews(id self, SEL _cmd)")
+        first = layout.index("GXKUpdateActionKey")
+        self.assertLess(layout.index("gOrigViewDidLayoutSubviews(self, _cmd)"), first)
+        self.assertLess(first, layout.index("dispatch_async"))
+
+    def test_native_key_lifecycle_hooks_are_class_local_not_global_uikit_hooks(self):
+        install = function_body(self.source, "static void GXKInstallIconWriteGuard(")
+        self.assertIn('NSClassFromString(@"GKBSoftKeyView")', install)
+        self.assertIn("class_addMethod", self.source + self.display)
+        for callback in ("didMoveToSuperview", "didMoveToWindow", "setSoftKeyDef:"):
+            self.assertIn(callback, self.source + self.display)
+        for forbidden in ("contentRectForBounds:", "titleRectForContentRect:",
+                          "intrinsicContentSize", "touchesBegan:", "touchesMoved:", "touchesEnded:"):
+            self.assertNotIn(forbidden, self.display)
+
+    def test_only_owned_overlays_are_styled_and_native_keycap_stays_read_only(self):
+        self.assertIn("[UIColor clearColor]", self.display)
+        self.assertIn("GXKNativeActionFont", self.display)
+        self.assertIn("foregroundColor", self.display)
+        self.assertNotRegex(self.display, r"(?:key|icon|body|root|nativeContent|nativeHost)\.(?:frame|bounds|backgroundColor|alpha|hidden)\s*=")
+        for native_repaint in ("backgroundLayer.bgColor", "backgroundLayer.borderWidth", "cornerRadius"):
+            self.assertNotIn(native_repaint, self.display)
+
+    def test_title_owner_preserves_composing_suggesting_idle_priority(self):
+        title = function_body(self.source, "static NSString *GXKActionTitle(")
+        for text in ('return @"重输";', 'return @"收起";', 'return @"换行";'):
+            self.assertIn(text, title)
+        self.assertLess(title.index('return @"重输";'), title.index("gSuggestingActive"))
+        self.assertIn("GXKActionTitle", self.display)
+        self.assertNotIn("setTitle:", self.display, "Input-only buttons must never own the visible title")
+
+    def test_native_nil_image_writes_are_not_confused_with_owned_clearing(self):
+        clear = function_body(self.source, "static void GXKClearIconImages(")
+        self.assertLess(clear.index("gxk_icon_write_bypass = YES"), clear.index("icon.image = nil"))
+        self.assertIn("gxk_icon_write_bypass = bypass", clear)
+        record = function_body(self.display, "static void GXKRecordActionImage(")
+        self.assertNotIn("!image", record)
+        self.assertIn("gxk_icon_write_bypass", record)
+        for callback in ("gxk_icon_setImage", "gxk_icon_setHighlightedImage",
+                         "gxk_layer_setImage", "gxk_layer_setHighlightedImage"):
+            self.assertIn("GXKRecordActionIconWrite", function_body(self.source, "static void " + callback + "("))
+
+    def test_model_with_empty_actions_never_authorizes_input(self):
+        predicate = function_body(self.source, "static BOOL GXKModelHasNativeActions(")
+        for check in ("respondsToSelector:@selector(actionsArray)", "isKindOfClass:[NSArray class]", "actions.count > 0"):
+            self.assertIn(check, predicate)
+        validate = function_body(self.display, "static GXKActionDisplayBinding *GXKValidateActionKeyPress(")
+        self.assertIn("GXKModelHasNativeActions", validate)
+        self.assertIn("clickAllowed", self.display)
+        self.assertNotIn("setActions", self.display)
+
+    def test_test_constructor_guard_does_not_change_production_initialization(self):
+        self.assertRegex(self.source, r"#ifndef GXK_ACTION_DISPLAY_TESTING\s+__attribute__\(\(constructor\)\)\s+#endif\s+static void gkx_init")
+        init = function_body(self.source, "static void gkx_init(")
+        self.assertIn("GXKInstallIconWriteGuard", init)
+        self.assertIn("GXKApplyTelemetryBlockIfNeeded", init)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

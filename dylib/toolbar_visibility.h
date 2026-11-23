@@ -123,7 +123,7 @@ static BOOL GXKToolbarPrepareNativeObstacles(UIView *root, UIView *logo) {
         while (pending.count && visited++ < 800) {
             UIView *view = pending.lastObject;
             [pending removeLastObject];
-            if (view == logo || view == gToolbarStack || view == gActionKeyButton ||
+            if (view == logo || view == gToolbarStack || view.tag == GXK_ACTION_TAG ||
                 [gToolbarOwnViews containsObject:view]) continue; // 自家视图不是原生遮挡。
             // Hidden keyboard owners are registered too: a 9→26 switch can reuse both objects.
             if ([view isKindOfClass:nineClass] || [view isKindOfClass:qwertyClass])
