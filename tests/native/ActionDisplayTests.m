@@ -5,44 +5,6 @@
 #import <XCTest/XCTest.h>
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
-#import <objc/runtime.h>
-#import <stdio.h>
-
-// Temporary CI-only boundary probe. Remove after the shared SIGSEGV is located.
-static void GXKDebugNativePhase(const char *phase) {
-    fprintf(stderr, "[DEBUG-native-ci] %s\n", phase);
-    fflush(stderr);
-}
-
-// Bounded subtree walk: a parent cycle surfaces as CYCLE instead of a hang.
-static NSUInteger GXKDebugDepth(UIView *view) {
-    if (!view) return 0;
-    NSMutableArray *stack = [NSMutableArray arrayWithObject:@[view, @0]];
-    NSMutableSet *seen = [NSMutableSet set];
-    NSUInteger deepest = 0, visited = 0;
-    while (stack.count && visited++ < 4000) {
-        NSArray *item = stack.lastObject;
-        [stack removeLastObject];
-        UIView *v = item[0];
-        NSUInteger d = [item[1] unsignedIntegerValue];
-        if ([seen containsObject:v]) {
-            fprintf(stderr, "[DEBUG-native-ci] CYCLE %s at depth %lu class=%s\n",
-                "subtree", (unsigned long)d, class_getName(object_getClass(v)));
-            fflush(stderr);
-            return 9999;
-        }
-        [seen addObject:v];
-        if (d > deepest) deepest = d;
-        for (UIView *s in v.subviews) [stack addObject:@[s, @(d + 1)]];
-    }
-    return deepest;
-}
-
-static void GXKDebugDepthPhase(const char *phase, UIView *view) {
-    fprintf(stderr, "[DEBUG-native-ci] %s depth=%lu subviews=%lu\n",
-        phase, (unsigned long)GXKDebugDepth(view), (unsigned long)view.subviews.count);
-    fflush(stderr);
-}
 
 @interface GKBImageLayer : CALayer {
     UIImage *_fixtureImage;
@@ -166,15 +128,10 @@ static void GXKDebugDepthPhase(const char *phase, UIView *view) {
 - (void)setSoftKeyDef:(GXKFixtureSoftKeyDef *)model {
     if (model == _fixtureDef) return;
     BOOL rebuild = !_fixtureDef || ![_fixtureDef.layout isEqualToString:model.layout];
-    GXKDebugNativePhase("setter: before reset");
     if (rebuild) [self resetView];
-    GXKDebugDepthPhase("setter: after reset", self);
     _fixtureDef = model;
     if (rebuild) [self buildNativeContents];
-    GXKDebugDepthPhase("setter: after build", self);
-    GXKDebugNativePhase("setter: before updateView");
     [self updateView];
-    GXKDebugDepthPhase("setter: after updateView", self);
 }
 - (void)resetView {
     // Stock resetView removes every child of hostView, including foreign children.
@@ -182,17 +139,12 @@ static void GXKDebugDepthPhase(const char *phase, UIView *view) {
     self.idToViewDict = @{};
 }
 - (void)buildNativeContents {
-    GXKDebugNativePhase("build: before content alloc");
     UIView *content = [[UIView alloc] initWithFrame:self.hostView.bounds];
     content.userInteractionEnabled = NO;
-    GXKDebugNativePhase("build: after content alloc");
     GKBImageViewWithBackground *icon = [[GKBImageViewWithBackground alloc] initWithFrame:content.bounds];
     icon.restorationIdentifier = @"image";
-    GXKDebugNativePhase("build: after icon alloc");
     [content addSubview:icon];
-    GXKDebugNativePhase("build: after content addSubview icon");
     [self.hostView addSubview:content]; // Native content must be first, before GXK's label.
-    GXKDebugNativePhase("build: after host addSubview content");
     NSMutableDictionary *contents = [@{@"image": icon} mutableCopy];
     if ([self.restorationIdentifier isEqualToString:@"key_pos_9keys_return"]) {
         UILabel *label = [[UILabel alloc] initWithFrame:content.bounds];
@@ -217,17 +169,13 @@ static void GXKDebugDepthPhase(const char *phase, UIView *view) {
     [self updateView];
 }
 - (void)updateView {
-    GXKDebugDepthPhase("updateView: entry", self);
     self.nativeUpdateCount++;
     GKBImageViewWithBackground *icon = self.idToViewDict[@"image"];
     UIView *native = self.hostView.subviews.firstObject;
     NSAssert(!icon || native == icon || [icon isDescendantOfView:native],
              @"Native update must find the real content in hostView.subviews.firstObject.");
-    GXKDebugNativePhase("updateView: before normalImage");
     icon.image = self.softKeyDef.normalImage;
-    GXKDebugNativePhase("updateView: after normalImage");
     icon.highlightedImage = self.softKeyDef.highlightedImage;
-    GXKDebugNativePhase("updateView: after highlightedImage");
 }
 - (void)layoutSubviews {
     [super layoutSubviews];
@@ -351,50 +299,7 @@ static NSUInteger GXKFixtureBluePixels(NSData *data) {
 - (void)setUp {
     [super setUp];
     XCTAssertTrue(NSThread.isMainThread, @"UIKit fixture must execute on the main thread.");
-    // Bisect the fixture view classes. The crash reproduces with no dylib hooks,
-    // so isolate which fixture class corrupts UIKit's view tree.
-    GXKDebugNativePhase("b1: before plain container");
-    {
-        UIView *container = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 48, 44)];
-        UIView *plain = [[UIView alloc] initWithFrame:container.bounds];
-        GXKDebugNativePhase("b1: before plain addSubview");
-        [container addSubview:plain];
-        GXKDebugNativePhase("b1: after plain addSubview");
-        GXKDebugNativePhase("b2: before CALayer subclass sublayer");
-        GKBImageLayer *layer = [[GKBImageLayer alloc] init];
-        layer.frame = container.bounds;
-        [container.layer addSublayer:layer];
-        GXKDebugNativePhase("b2: after CALayer subclass sublayer");
-        GXKDebugNativePhase("b3: before icon alloc");
-        GKBImageViewWithBackground *icon = [[GKBImageViewWithBackground alloc] initWithFrame:container.bounds];
-        fprintf(stderr, "[DEBUG-native-ci] b3: icon sublayers=%lu layerClass=%s\n",
-            (unsigned long)icon.layer.sublayers.count, class_getName(object_getClass(icon.layer)));
-        fflush(stderr);
-        GXKDebugNativePhase("b3: after icon alloc");
-        GXKDebugNativePhase("b4: before icon addSubview");
-        [container addSubview:icon];
-        GXKDebugNativePhase("b4: after icon addSubview");
-        container = nil;
-    }
-    GXKDebugNativePhase("b: all fixture classes survived");
-    // Bisect 1: identical fixture construction with NO dylib hooks installed.
-    // Surviving here means the dylib hook path owns the crash.
-    GXKDebugNativePhase("pre-hook probe: before alloc");
-    GKBSoftKeyView *probeKey = [GKBSoftKeyView alloc];
-    GXKDebugNativePhase("pre-hook probe: after alloc");
-    probeKey = [probeKey initWithFrame:CGRectMake(0, 0, 48, 44)];
-    GXKDebugNativePhase("pre-hook probe: after init");
-    probeKey.restorationIdentifier = @"key_pos_9keys_return";
-    GXKFixtureSoftKeyDef *probeModel = [[GXKFixtureSoftKeyDef alloc] init];
-    probeModel.actionsArray = @[@"native-action"];
-    probeModel.layout = @"pre-hook-probe";
-    GXKDebugNativePhase("pre-hook probe: before model assignment");
-    probeKey.softKeyDef = probeModel;
-    GXKDebugNativePhase("pre-hook probe: after model assignment");
-    probeKey = nil;
-    GXKDebugNativePhase("before hook installation");
     GXKInstallIconWriteGuard(); // Install the actual production native/key/layer hooks.
-    GXKDebugNativePhase("after hook installation");
     gCurrentVC = nil;
     GXKDetachActionKey();
     GXKStopPolling();
@@ -403,28 +308,19 @@ static NSUInteger GXKFixtureBluePixels(NSData *data) {
     gComposingActive = NO;
     gSuggestingActive = NO;
     gComposingScanAt = 0;
-    GXKDebugNativePhase("before fixture images");
     self.normalImage = GXKFixtureImage(UIColor.blueColor);
     self.highlightedImage = GXKFixtureImage(UIColor.orangeColor);
-    GXKDebugNativePhase("before controller initialization");
     self.controller = [[GXKFixtureKeyboardController alloc] init];
-    GXKDebugNativePhase("after controller initialization");
     self.controller.fixtureProxy = [[GXKFixtureProxy alloc] init];
     self.fixtureWindow = [[UIWindow alloc] initWithFrame:CGRectMake(0, 0, 390, 844)];
-    GXKDebugNativePhase("before root controller assignment");
     self.fixtureWindow.rootViewController = self.controller;
-    GXKDebugNativePhase("after root controller assignment / before window display");
     [self.fixtureWindow makeKeyAndVisible];
-    GXKDebugNativePhase("after window display");
     gCurrentVC = self.controller;
     self.body = [[GKB9KeysSoftKeyboardView alloc] initWithFrame:CGRectMake(0, 120, 390, 260)];
     [self.controller.view addSubview:self.body];
-    GXKDebugNativePhase("before native return key construction");
     self.returnKey = [self makeKey:@"key_pos_9keys_return" separateHost:NO attach:NO];
-    GXKDebugNativePhase("after native return key construction");
     self.returnKey.frame = CGRectMake(330, 200, 48, 44);
     [self.body addSubview:self.returnKey];
-    GXKDebugNativePhase("after native return key attachment / setup complete");
 }
 - (void)tearDown {
     gCurrentVC = nil;
@@ -451,22 +347,14 @@ static NSUInteger GXKFixtureBluePixels(NSData *data) {
     return model;
 }
 - (GKBSoftKeyView *)makeKey:(NSString *)identity separateHost:(BOOL)separate attach:(BOOL)attach {
-    GXKDebugNativePhase("before key alloc");
-    GKBSoftKeyView *key = [GKBSoftKeyView alloc];
-    GXKDebugNativePhase("after key alloc");
-    key = [key initWithFrame:CGRectMake(330, 145, 48, 44)];
-    GXKDebugNativePhase("after key init");
+    GKBSoftKeyView *key = [[GKBSoftKeyView alloc] initWithFrame:CGRectMake(330, 145, 48, 44)];
     key.restorationIdentifier = identity;
-    GXKDebugNativePhase("after identity assignment");
     if (separate) {
         key.separateHost = [[UIView alloc] initWithFrame:key.bounds];
         key.separateHost.userInteractionEnabled = NO;
         [key addSubview:key.separateHost];
     }
-    GXKFixtureSoftKeyDef *model = [self modelWithActions:@[@"native-action"] layout:@"icon"];
-    GXKDebugNativePhase("after model creation");
-    key.softKeyDef = model;
-    GXKDebugNativePhase("after model assignment");
+    key.softKeyDef = [self modelWithActions:@[@"native-action"] layout:@"icon"];
     if (attach) [self.body addSubview:key];
     return key;
 }

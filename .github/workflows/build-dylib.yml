@@ -35,36 +35,6 @@ jobs:
         timeout-minutes: 15
         run: bash tests/native/run_tests.sh
 
-      # Temporary SIGSEGV diagnosis: retain only this fixture host's system reports.
-      - name: Collect native host crash reports
-        if: always()
-        run: |
-          python3 - <<'PY'
-          import datetime, hashlib, json, pathlib, shutil
-          home = pathlib.Path.home()
-          roots = [home / 'Library/Logs/DiagnosticReports']
-          roots += list((home / 'Library/Developer/CoreSimulator/Devices').glob('*/data/Library/Logs/DiagnosticReports'))
-          roots += list((home / 'Library/Developer/CoreSimulator/Devices').glob('*/data/Library/Logs/CrashReporter'))
-          out = pathlib.Path('_scratch') / (datetime.date.today().isoformat() + '-native-action-display') / 'crash-reports'
-          out.mkdir(parents=True, exist_ok=True)
-          copied, errors = [], []
-          for root in roots:
-              try:
-                  for report in root.rglob('GXKNativeHost*'):
-                      if not report.is_file() or report.suffix not in ('.ips', '.crash'):
-                          continue
-                      target = out / (hashlib.sha256(str(report).encode()).hexdigest()[:12] + '-' + report.name)
-                      if target.exists():
-                          raise FileExistsError(str(target))
-                      shutil.copyfile(report, target)
-                      copied.append(str(target))
-              except OSError as error:
-                  errors.append(str(error))
-          summary = {'copied': copied, 'errors': errors, 'nativeTests': 'SEE TEST STEP; REPORT COLLECTION IS NOT A PASS'}
-          (out / 'collection.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
-          print(json.dumps(summary))
-          PY
-
       - name: Preserve native regression evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -82,7 +52,6 @@ jobs:
             _scratch/**/exit-status.txt
             _scratch/**/final-exit-status.txt
             _scratch/**/verify-result.log
-            _scratch/**/crash-reports/**
           include-hidden-files: true
           if-no-files-found: warn
 
