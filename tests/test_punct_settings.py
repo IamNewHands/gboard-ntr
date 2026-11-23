@@ -66,14 +66,20 @@ class PunctSettingsTest(unittest.TestCase):
         # 不能用「首字符是否 ASCII」——英文系统下拼音页也是 ASCII，会误判成数字页。
         reader = function_body(self.popup, "static NSString *GXKPunctKeyLabelText(UIView *key)")
         self.assertIn('contents[@"label"]', reader)
-        self.assertIn("return [text isKindOfClass:[NSString class]] ? text : nil;", reader)
+        # 数字页那一格的键帽文字不在 idToViewDict 上，而在带 caption 的图片视图里，
+        # 所以取字这一步必须认 caption / -text，不能只认 UILabel。
+        self.assertIn('GXKPunctTextOfView(contents[@"label"])', reader)
+        caption = function_body(self.popup, "static NSString *GXKPunctTextOfView(id view)")
+        self.assertIn('valueForKey:@"captionLabel"', caption)
+        self.assertIn("captionView != view", caption)  # 自引用会无限递归
         body = function_body(self.popup, "static GXKPunctPage GXKPunctPageForKey(UIView *key)")
+        # 有 ident 就是拼音页，这一条不依赖能否读到字。
+        self.assertIn("if (key.restorationIdentifier.length) return GXKPunctPagePinyin;", body)
         self.assertIn("GXKPunctKeyLabelText(key)", body)
         self.assertIn("text.length > 1 ? GXKPunctPageDigit : GXKPunctPagePinyin", body)
         self.assertNotIn("characterAtIndex:0", body)
         # 读不到字时保持上一次判定，不退回固定页——猜错会让数字页弹出中文表。
         self.assertIn("return gPunctPage;", body)
-        self.assertNotIn("return GXKPunctPagePinyin;", body)
 
     def test_digit_key_is_recognised_without_a_restoration_identifier(self) -> None:
         # 真机日志：数字页 24 个可见软键只有 8 个带 ident，key_pos_9keys_4_1 不在其中，
@@ -81,18 +87,30 @@ class PunctSettingsTest(unittest.TestCase):
         # 没有 ident 才按键帽文字认，且文字必须是「多个标点字符」。
         body = function_body(self.popup, "static BOOL GXKPunctKeyMatches(UIView *key)")
         self.assertIn("if (ident.length) return [ident isEqualToString:GXK_PUNCT_KEY_IDENT];", body)
-        self.assertIn("return GXKPunctLabelIsPunctCandidates(GXKPunctKeyLabelText(key));", body)
+        # 先读键帽文字（便宜），读不出来才问 softKeyDef——真机上这一格的 caption
+        # 可能整个用图绘制，文字那一路全空，只剩 def 还能证明它是哪一格。
+        self.assertIn("if (GXKPunctLabelIsPunctCandidates(GXKPunctKeyLabelText(key))) return YES;", body)
+        self.assertIn("return GXKPunctKeyDefIsPunctuation(key);", body)
         text = function_body(self.popup,
                              "static BOOL GXKPunctLabelIsPunctCandidates(NSString *text)")
         self.assertIn("text.length < 2 || text.length > 8", text)
+        self.assertIn("GXKPunctCharIsPunct([text characterAtIndex:i])", text)
         # 必须「每个字符都是标点/符号」，而不是「不含字母数字」：
         # 后者会把「按键盘」「符号」这类汉字标签放进来，数字页不止一格命中，
         # find 会按布局不确定放弃，长按照样没反应。
-        self.assertIn("[NSCharacterSet punctuationCharacterSet]", text)
-        self.assertIn("[NSCharacterSet symbolCharacterSet]", text)
-        self.assertIn("![punct characterIsMember:ch] && ![symbol characterIsMember:ch]", text)
+        char = function_body(self.popup, "static BOOL GXKPunctCharIsPunct(unichar ch)")
+        self.assertIn("[NSCharacterSet punctuationCharacterSet]", char)
+        self.assertIn("[NSCharacterSet symbolCharacterSet]", char)
         # 数字键 0-9、空格「空格」、回车「换行」都不属于标点/符号，必须被排除。
         self.assertIn("return NO;", text)
+        # def 判定会拼 -description 字符串，必须按键缓存，否则每帧几十次分配。
+        # 缓存要连着 def 对象一起存：键体视图会被原生复用，切页后绑的是另一个 def。
+        def_check = function_body(self.popup,
+                                  "static BOOL GXKPunctKeyDefIsPunctuation(UIView *key)")
+        self.assertIn("objc_getAssociatedObject", def_check)
+        self.assertIn("cached[0] == def", def_check)
+        self.assertIn("objc_setAssociatedObject", def_check)
+        self.assertIn('rangeOfString:@"punctuation"', def_check)
         # 两处调用点都走同一个判定，不许再出现裸的 ident 比较。
         find = function_body(self.popup, "static UIView *GXKPunctFindKey(UIView *root) {")
         self.assertIn("if (GXKPunctKeyMatches(v)) {", find)

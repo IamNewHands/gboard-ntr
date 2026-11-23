@@ -670,9 +670,16 @@ class PerfContracts(unittest.TestCase):
         # 无 ident 的键帽文字清单同样只在诊断打开时建：数字页每帧都要扫这棵树。
         self.assertIn("NSMutableArray<NSString *> *seenLabels = diag ? [NSMutableArray array] : nil;", find)
         self.assertIn("if (diag && ident.length == 0) {", find)
-        self.assertIn("if (text.length && ![seenLabels containsObject:text]) [seenLabels addObject:text];", find)
+        # 记的是「原始收集结果」而不是最终判定：判定为空时才能看出是没文字还是被标据否掉。
+        self.assertIn("GXKPunctCollectTexts(v, 0, raw);", find)
+        self.assertIn("if (![seenLabels containsObject:entry]) [seenLabels addObject:entry];", find)
+        # 收集与去重都必须落在 diag 判断之内，不能每帧无条件跑。
+        self.assertLess(find.index("if (diag && ident.length == 0) {"), find.index("GXKPunctCollectTexts(v, 0, raw);"))
+        # 拼日志字符串只能发生在 if (diag) 里面：上面 label 条目里的 componentsJoinedByString
+        # 属于诊断块内部，不能拿来当锚点。
         self.assertLess(find.index("if (diag) {"), find.index("gDiagFindMiss++"))
-        self.assertLess(find.index("gDiagFindMiss++"), find.index("componentsJoinedByString"))
+        report = find[find.index("if (diag) {"):]
+        self.assertIn("componentsJoinedByString", report)
 
 
 if __name__ == "__main__":
