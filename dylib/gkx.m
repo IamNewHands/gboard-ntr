@@ -22,11 +22,13 @@
 
 static NSString *const GXKGroup = @"group.zunbengege.top";
 static NSString *const GXKEmojiKeyID = @"key_pos_9keys_emoji";
-// 齿轮键（切语言键）：九键左列第 3 键与 26 键右上角键，原包映射表里都是 softkey_globe，
+// 齿轮键（切语言键）：九键左列第 3 格与 26 键右上角键，原包映射表里都是 softkey_globe，
 // 只有图标没有文字标签，所以整块换成「中/英」不会和任何原生文字打架。
-// 九键这一格本来是第 4 键（left_4）；tools/nib_left_column.py 把 left_3 与 left_4 的
-// restorationIdentifier 对调后，中英键占据第 3 格、符号键落到第 4 格，所以这里必须跟着改成 left_3。
-static NSString *const GXKLangKeyID9 = @"key_pos_9keys_left_3";
+// 语义跟的是 restorationIdentifier，不是格子位置：appex 内联布局表里
+// key_pos_9keys_left_3 → softkey_9keys_switch_to_symbol、key_pos_9keys_left_4 → softkey_globe。
+// tools/nib_left_column.py 对调这两个 ID 后，带 left_4 的对象落到第 3 格并渲染齿轮，
+// 所以这里必须继续认 left_4，覆盖层才会挂到第 3 格那把键上。
+static NSString *const GXKLangKeyID9 = @"key_pos_9keys_left_4";
 static NSString *const GXKLangKeyID26 = @"key_pos_globe";
 // 未选中那一段的亮度：与选中段同色，只降透明度，跟随原生主题换色。
 #define GXK_LANG_DIM_ALPHA 0.35

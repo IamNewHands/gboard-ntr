@@ -2,7 +2,8 @@
 """齿轮键「中/英」覆盖层源码契约；不声称 UIKit 运行时行为。
 
 本机没有 clang，真机行为靠 GitHub Actions 编译后再验；这里锁住几条硬约束：
-    1. 只认两把已证键 ID（九键 key_pos_9keys_left_3、26 键 key_pos_globe），
+    1. 只认两把已证键 ID（九键 key_pos_9keys_left_4、26 键 key_pos_globe），
+       九键那把跟的是 ID 的语义（left_4 → softkey_globe），不是第几格；
        绝不按坐标、按键顺序或标题文字找键；
     2. 覆盖按钮是纯视觉层（userInteractionEnabled = NO），不改触摸链、
        不新增手势，切换语言仍走原生路径；
@@ -48,7 +49,7 @@ class LangKeySourceContracts(unittest.TestCase):
         cls.source = SOURCE.read_text(encoding="utf-8")
 
     def test_only_the_two_verified_key_ids_are_used(self):
-        self.assertIn('static NSString *const GXKLangKeyID9 = @"key_pos_9keys_left_3";', self.source)
+        self.assertIn('static NSString *const GXKLangKeyID9 = @"key_pos_9keys_left_4";', self.source)
         self.assertIn('static NSString *const GXKLangKeyID26 = @"key_pos_globe";', self.source)
         matcher = function_body(self.source, "static BOOL GXKLangKeyIDMatches(UIView *key) {")
         self.assertIn("restorationIdentifier", matcher)
