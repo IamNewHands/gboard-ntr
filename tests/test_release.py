@@ -88,9 +88,8 @@ class WorkflowContracts(unittest.TestCase):
         self.assertIn("bash tests/native/run_tests.sh", self.text)
         self.assertLess(self.text.index("bash tests/native/run_tests.sh"),
                         self.text.index("- name: Build libgkx.dylib"))
-        # 夹具 SIGSEGV 是测试侧缺陷，不阻断 dylib/IPA；非阻断必须附已知缺口说明。
-        self.assertIn("continue-on-error: true", self.text)
-        self.assertIn("buildNativeContents", self.text)
+        # 夹具修好后是真门禁（833c92c）：非阻断逃生门一旦回来，真实回归就会被静默放过。
+        self.assertNotIn("continue-on-error: true", self.text)
         self.assertIn("needs: build", self.text)
 
     def test_publish_job_depends_on_build(self):
