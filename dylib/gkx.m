@@ -1713,6 +1713,7 @@ static void gkx_textDidChange(id self, SEL _cmd, id textInput) {
 static void GXKSymbolInvalidatePageCache(void);
 static void GXKSymbolInstallHooks(void);
 static void GXKSymbolNoteLayout(void);
+static void GXKSymbolResetPageState(void);
 // punct_popup.h 同理：标点键长按弹层在布局拍里定位，隐藏时随键盘一起撤走。
 static void GXKPunctPopupUpdate(UIViewController *vc);
 static void GXKPunctPopupTeardown(void);
@@ -1792,6 +1793,7 @@ static void gkx_viewWillDisappear(id self, SEL _cmd, BOOL animated) {
         GXKDetachToolbar(); // 扩展隐藏后工具条随宿主一起撤走，下次出现重新定位。
         GXKDetachPhrasesPanel(); // 常用语面板随扩展隐藏一起撤走。
         GXKPunctPopupTeardown(); // 标点长按弹层与手势一并撤销，下次出现重新挂。
+        GXKSymbolResetPageState(); // 回拼音任务/双击状态不跨键盘会话。
         GXKReleaseHaptics(); // 扩展隐藏后不常驻触觉引擎。
     }
     if (gOrigViewWillDisappear) gOrigViewWillDisappear(self, _cmd, animated);
@@ -1931,6 +1933,7 @@ static void GXKSwizzleOrSkip(NSString *className, NSString *selName, IMP imp, vo
 
 // 九键符号页：双击上屏并停留（依赖上面的 GXKSwizzleOrSkip）。
 #import "punct_diag.h" // [DIAG-punct] 必须在两个埋点文件之前
+#import "keyboard_page_identity.h" // 原生本轮加载名：数字页与符号页不再共用身份。
 #import "symbol_doubletap.h"
 #import "punct_popup.h"
 

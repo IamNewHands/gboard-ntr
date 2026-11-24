@@ -12,8 +12,7 @@
 // 为什么是「跳过第二击」而不是「上屏后再删」：
 //   跳过只需一行，文本天然只上屏一次；删字符会和成对补全抢同一个光标位置。
 //
-// 性能：判定「是否在符号页」走两条路——fire 里从被按的键往上找祖先标识（O(深度)），
-// 其余场合用按布局失效的缓存（每次布局至多一次全树 BFS），不在打字热路径上做全树扫描。
+// 性能：fire 只读被按的键所属原生九键体；其它场合读 weak 页身份登记，不做全树扫描。
 //
 // 锁定（gSymbolLocked）：双击一次 = 常驻符号页，此后每次单击只上屏、不再回拼音；
 // 再双击同一格解除，或切到拼音/数字/表情等任何别的页面也自动解除（见 GXKSymbolNoteLayout）。
@@ -25,15 +24,16 @@
 
 #define GXK_SYMBOL_TAP_WINDOW 0.25    // 两击之间允许的最大间隔，超过即两次单击
 #define GXK_SYMBOL_RETURN_DELAY 0.28  // 单击后多久回拼音，必须略大于双击窗口
-#define GXK_SYMBOL_PAGE_IDENT @"key_pos_9keys_symbols"
-
-static void (*gOrigSymbolShouldReturnToPrime)(id, SEL, id);
+static BOOL (*gOrigSymbolShouldReturnToPrime)(id, SEL, id);
+static BOOL (*gOrigZhSymbolShouldReturnToPrime)(id, SEL, id);
 static void (*gOrigSymbolFireEvent)(id, SEL, id, id);
 static __weak UIView *gSymbolHostCache;
 static BOOL gSymbolPageCacheValid;
 static __weak UIView *gSymbolLastFireView;
+static __weak UIView *gSymbolLastFireBody;
 static NSTimeInterval gSymbolLastFireAt;
 static dispatch_block_t gSymbolReturnWork;
+static NSUInteger gSymbolReturnGeneration; // 只由回页取消/换页推进，不受成对补全消耗影响。
 static BOOL gSymbolLocked; // 双击锁定：YES 时符号页常驻，单击不回拼音。
 static NSUInteger gSymbolPairToken; // 补全重试的序号：新的一击作废旧的重试。
 
@@ -89,46 +89,25 @@ static id<UITextDocumentProxy> GXKSymbolProxy(void) {
     return ((UIInputViewController *)vc).textDocumentProxy;
 }
 
-// 从被按的键往上找符号页标识：命中即当前就在九键符号页。O(深度)，可在 fire 里直接调用。
+// key_pos_9keys_symbols 同时存在于 123 和符号页，不能代表分页。
 static BOOL GXKSymbolViewIsOnSymbolPage(UIView *view) {
-    NSUInteger depth = 0;
-    for (UIView *cursor = view; cursor && depth++ < 24; cursor = cursor.superview) {
-        NSString *ident = cursor.restorationIdentifier;
-        if ([ident isKindOfClass:[NSString class]] && [ident isEqualToString:GXK_SYMBOL_PAGE_IDENT]) {
-            return !cursor.isHidden;
-        }
-    }
-    return NO;
+    return GXKNineKeyPageForView(view) == GXKNineKeyPageSymbol;
 }
 
-// 符号页那一格：只认 restorationIdentifier 为 key_pos_9keys_symbols、且真正上屏的视图。
-// 早先这条判定住在诊断探针里，探针删掉后留在生产路径上——它是符号页识别本身，不是埋点。
-// v9 的教训：光看 GKBSoftKeyCollectionView 会把 123 页也认成符号页，所以只认标识符。
+// 只读原生 Helper 标注过且属于当前可见 root 的真正符号键体。
 static UIView *GXKSymbolFindHost(UIView *root) {
-    if (![root isKindOfClass:[UIView class]]) return nil;
-    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
-    NSUInteger visited = 0;
-    while (stack.count && visited++ < 3000) {
-        UIView *view = stack.lastObject;
-        [stack removeLastObject];
-        NSString *ident = view.restorationIdentifier;
-        BOOL named = [ident isKindOfClass:[NSString class]] &&
-                     [ident isEqualToString:GXK_SYMBOL_PAGE_IDENT];
-        if (named && !view.isHidden && !CGRectIsEmpty(view.bounds)) return view;
-        [stack addObjectsFromArray:view.subviews];
-    }
-    return nil;
+    return GXKNineKeyVisibleBodyForPage(root, GXKNineKeyPageSymbol);
 }
 
-// 全树判定：只用于拿不到按键视图的场合（shouldReturnToPrimeOnKey:）。
-// 结果按布局缓存，布局一变（换页必然触发布局）就失效，不在打字热路径上重复扫描。
+// 拿不到按键视图时读原生页登记；缓存正结果也必须复核当前 root 归属与完整可见性。
 static UIView *GXKSymbolHost(void) {
     UIViewController *vc = gCurrentVC;
     if (!vc || !vc.isViewLoaded) return nil;
     if (gSymbolPageCacheValid) {
         UIView *cached = gSymbolHostCache;
         if (!cached) return nil;
-        if (cached.window && !cached.isHidden) return cached;
+        if (GXKNineKeyPageForBody(cached) == GXKNineKeyPageSymbol &&
+            GXKKeyIsVisible(cached, vc.view)) return cached;
     }
     UIView *host = GXKSymbolFindHost(vc.view);
     gSymbolHostCache = host;
@@ -140,10 +119,31 @@ static void GXKSymbolInvalidatePageCache(void) { gSymbolPageCacheValid = NO; }
 
 static BOOL GXKSymbolPageActive(void) { return GXKSymbolHost() != nil; }
 
+static BOOL GXKNineKeyDigitPageActive(void) {
+    UIViewController *vc = gCurrentVC;
+    return vc && vc.isViewLoaded && GXKNineKeyVisibleBodyForPage(vc.view, GXKNineKeyPageDigit) != nil;
+}
+
 static void GXKSymbolCancelReturn(void) {
+    gSymbolReturnGeneration++;
     dispatch_block_t work = gSymbolReturnWork;
     gSymbolReturnWork = nil;
     if (work) dispatch_block_cancel(work);
+}
+
+static void GXKSymbolResetPageState(void) {
+    GXKSymbolCancelReturn();
+    gSymbolPairToken++;
+    gSymbolLocked = NO;
+    gSymbolLastFireView = nil;
+    gSymbolLastFireBody = nil;
+    gSymbolLastFireAt = 0;
+    GXKSymbolInvalidatePageCache();
+}
+
+static void GXKSymbolPageBodyRetired(UIView *body) {
+    if (body == gSymbolLastFireBody) GXKSymbolResetPageState();
+    GXKSymbolInvalidatePageCache();
 }
 
 // 回拼音：GKBInputViewControllerBase -inputBundleManager -> GKBInputBundle -switchToPrimeKeyboard。
@@ -159,9 +159,7 @@ static void GXKSymbolSwitchToPrime(void) {
     SEL switchSel = NSSelectorFromString(@"switchToPrimeKeyboard");
     if (!bundle || ![bundle respondsToSelector:switchSel]) return;
     ((void (*)(id, SEL))objc_msgSend)(bundle, switchSel);
-    gSymbolLastFireView = nil;
-    gSymbolLastFireAt = 0;
-    GXKSymbolInvalidatePageCache();
+    GXKSymbolResetPageState();
 }
 
 // 单击后延时回拼音；这段时间内的第二次 fire 会把它取消。
@@ -169,9 +167,12 @@ static void GXKSymbolSwitchToPrime(void) {
 static void GXKSymbolScheduleReturn(void) {
     GXKSymbolCancelReturn();
     if (gSymbolLocked) return;
+    __weak UIView *originBody = gSymbolLastFireBody;
+    NSUInteger generation = gSymbolReturnGeneration;
     dispatch_block_t work = dispatch_block_create(0, ^{
+        if (generation != gSymbolReturnGeneration) return;
         gSymbolReturnWork = nil;
-        if (GXKSymbolPageActive()) GXKSymbolSwitchToPrime(); // 已经离开就不重复切
+        if (originBody && originBody == GXKSymbolHost()) GXKSymbolSwitchToPrime();
     });
     gSymbolReturnWork = work;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(GXK_SYMBOL_RETURN_DELAY * NSEC_PER_SEC)),
@@ -314,15 +315,13 @@ static void GXKSymbolFireEvent(id self, SEL _cmd, id bundle, id event) {
 
     if (onSymbolPage) {
         gSymbolLastFireView = view;
+        UIViewController *vc = gCurrentVC;
+        gSymbolLastFireBody = (view && vc.isViewLoaded) ? GXKNineKeyBodyForKey(view, vc.view) : GXKSymbolHost();
         gSymbolLastFireAt = now;
     } else {
         // 这一击不在符号页：锁定就地解除，不等布局回调（切页后立刻打字也能复位）。
         // 同时作废还没落地的补全重试，免得它把右半边补进这一击所在的页面。
-        gSymbolPairToken++;
-        gSymbolLocked = NO;
-        gSymbolLastFireView = nil;
-        gSymbolLastFireAt = 0;
-        GXKSymbolCancelReturn();
+        GXKSymbolResetPageState();
     }
 
     // 转发之前先存一份光标前文本：宿主是同步写还是异步写，靠「内容变了没有」判定。
@@ -357,38 +356,36 @@ static void GXKSymbolFireEvent(id self, SEL _cmd, id bundle, id event) {
 // 布局变化后校正锁定：离开符号页（切拼音/数字/表情）就自动解除。
 // 由 gkx_viewDidLayoutSubviews 调用，本身不做任何扫描，只读布局阶段已经算好的缓存。
 static void GXKSymbolNoteLayout(void) {
-    if (!gSymbolLocked) return;
-    if (GXKSymbolPageActive()) return;
-    gSymbolLocked = NO;
-    GXKSymbolCancelReturn();
+    if (GXKSymbolPageActive() && (!gSymbolLastFireBody || GXKSymbolHost() == gSymbolLastFireBody)) return;
+    GXKSymbolResetPageState();
 }
 
 static BOOL GXKSymbolShouldReturnToPrime(id self, SEL _cmd, id key) {
-    // 九键符号页不自动切走；其它页面（26 键符号页等）保持原生行为。
-    if (GXKSymbolPageActive()) return NO;
-    // 不在这页了：锁定和残留状态一起清掉，下次进来从「单击」重新开始。
-    gSymbolLocked = NO;
-    gSymbolLastFireView = nil;
-    gSymbolLastFireAt = 0;
-    GXKSymbolCancelReturn();
-    if (gOrigSymbolShouldReturnToPrime) {
-        return ((BOOL (*)(id, SEL, id))gOrigSymbolShouldReturnToPrime)(self, _cmd, key);
-    }
-    return YES;
+    // 数字页始终常驻；符号页的停留/返回仍由本模块双击时间窗控制。
+    if (GXKNineKeyDigitPageActive() || GXKSymbolPageActive()) return NO;
+    GXKSymbolResetPageState();
+    return gOrigSymbolShouldReturnToPrime ? gOrigSymbolShouldReturnToPrime(self, _cmd, key) : YES;
+}
+
+static BOOL GXKZhSymbolShouldReturnToPrime(id self, SEL _cmd, id key) {
+    if (GXKNineKeyDigitPageActive() || GXKSymbolPageActive()) return NO;
+    GXKSymbolResetPageState();
+    return gOrigZhSymbolShouldReturnToPrime ? gOrigZhSymbolShouldReturnToPrime(self, _cmd, key) : YES;
 }
 
 static void GXKSymbolInstallHooks(void) {
     static BOOL installed;
+    GXKInstallNineKeyPageHooks();
     if (installed) return;
     if (!NSClassFromString(@"GKBTapTouchHandler")) return; // framework 未加载，下次再试
     installed = YES;
     // 只挂这两个类自身的单点方法：不碰任何 touchesBegan/Moved/Ended/Cancelled。
-    // 原实现只取一次：两个类回退目标都是九键符号键盘那一个。
+    // 两个类各自拥有实现、ABI 均为 B24@0:8@16；分别保存，26 键回退不串类。
     GXKSwizzleOrSkip(@"GKBSymbolKeyboard", @"shouldReturnToPrimeOnKey:",
                      (IMP)GXKSymbolShouldReturnToPrime,
                      (void **)&gOrigSymbolShouldReturnToPrime);
     GXKSwizzleOrSkip(@"GKBZhSymbolKeyboard", @"shouldReturnToPrimeOnKey:",
-                     (IMP)GXKSymbolShouldReturnToPrime, NULL);
+                     (IMP)GXKZhSymbolShouldReturnToPrime, (void **)&gOrigZhSymbolShouldReturnToPrime);
     GXKSwizzleOrSkip(@"GKBTapTouchHandler", @"touchActionBundle:fireEvent:",
                      (IMP)GXKSymbolFireEvent, (void **)&gOrigSymbolFireEvent);
 }

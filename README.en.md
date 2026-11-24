@@ -23,7 +23,9 @@ The YouTube, Contacts, GIF and Sticker pages are removed, leaving emoji, kaomoji
 A "常用语" page is added to the G-logo picker and follows the keyboard skin. With pinning off, tapping a phrase inserts it and closes the panel; with pinning on, the panel stays open. It can be edited inside the keyboard, and Settings → Gboard → Phrases in the main app is a second entry point.
 
 **5. Punctuation long-press popup**
-Holding the nine-key "，。？！" key for 0.32 s shows a row of symbols; slide to one and release to insert it. The symbol list and the count (1–10) are editable in the main app, and the colours follow the keyboard skin.
+Holding the punctuation key on either the nine-key pinyin or 123 page for 0.32 s shows a row of symbols; slide to one and release to insert it. Each page has its own editable symbol list and count (1–10), and the colours follow the keyboard skin. The digit key is located by its native `softkey_9keys_punctuation_candidates` definition, not its rendered caption.
+
+The 123 page stays open after typing until you switch pages yourself. The separate symbol page keeps single-tap return to pinyin, double-tap locking, and paired-symbol completion.
 
 **6. Diagnostic log (off by default)**
 Nothing is recorded by default. The switch lives in Settings → Gboard → Diagnostic log and takes effect across processes within half a second.

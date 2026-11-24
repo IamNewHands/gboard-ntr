@@ -48,8 +48,8 @@ class DiagSwitchTest(unittest.TestCase):
     def test_symbol_page_lookup_survived_the_probe(self) -> None:
         # 符号页判定是生产路径（shouldReturnToPrimeOnKey: 靠它），不能随探针一起消失。
         body = function_body(self.symbol, "static UIView *GXKSymbolFindHost(")
-        self.assertIn("GXK_SYMBOL_PAGE_IDENT", body)
-        self.assertIn("CGRectIsEmpty", body)
+        self.assertIn("GXKNineKeyVisibleBodyForPage(root, GXKNineKeyPageSymbol)", body)
+        self.assertNotIn("restorationIdentifier", body)
         host = function_body(self.symbol, "static UIView *GXKSymbolHost(")
         self.assertIn("GXKSymbolFindHost(", host)
 
