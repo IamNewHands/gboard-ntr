@@ -60,24 +60,26 @@ class PunctSettingsTest(unittest.TestCase):
         self.assertIn("n = GXK_PUNCT_MAX_SYMBOLS", body)
         self.assertIn("if (n > GXK_PUNCT_MAX_SYMBOLS)", body)
 
-    def test_page_is_told_apart_by_the_native_key_definition(self) -> None:
-        # 数字页键没有 ident/caption；精确 id_p 决定数字表，拼音固定键位不变。
+    def test_page_is_told_apart_by_the_actual_native_layout(self) -> None:
+        # 两页真机日志中的 id_p 相同；它只定位键，实际 layout 才决定独立配置。
         reader = function_body(self.popup, "static NSString *GXKPunctKeyDefinitionID(UIView *key)")
         self.assertIn("softKeyDef", reader)
         self.assertIn("@selector(id_p)", reader)
         self.assertIn(".id_p", reader)
         self.assertNotIn("description", reader)
         body = function_body(self.popup, "static GXKPunctPage GXKPunctPageForKey(UIView *key)")
-        self.assertIn("GXKPunctKeyDefinitionID(key)", body)
-        self.assertIn("GXK_PUNCT_DIGIT_KEY_DEF", body)
-        self.assertIn("GXKPunctPageDigit : GXKPunctPagePinyin", body)
-        self.assertNotIn("text.length", body)
+        self.assertIn("GXKNineKeyPageForView(key)", body)
+        self.assertIn("GXKNineKeyPagePinyin", body)
+        self.assertIn("GXKNineKeyPageDigit", body)
+        self.assertIn("return GXKPunctPageUnknown", body)
+        self.assertNotIn("GXKPunctKeyDefinitionID", body)
+        self.assertNotIn("restorationIdentifier", body)
         self.assertNotIn("return gPunctPage", body)
 
     def test_digit_key_is_recognised_without_a_caption_or_identifier(self) -> None:
         body = function_body(self.popup, "static BOOL GXKPunctKeyMatches(UIView *key)")
         self.assertIn("GXKPunctKeyDefinitionID(key)", body)
-        self.assertIn("GXK_PUNCT_DIGIT_KEY_DEF", body)
+        self.assertIn("GXK_PUNCT_KEY_DEF", body)
         self.assertIn("key.restorationIdentifier isEqualToString:GXK_PUNCT_KEY_IDENT", body)
         self.assertIn('@"softkey_9keys_punctuation_candidates"', self.popup)
         self.assertNotIn("GXKPunctKeyLabelText", self.popup)
@@ -87,7 +89,30 @@ class PunctSettingsTest(unittest.TestCase):
         self.assertIn("GXKNineKeyBodyForKey(v, root)", find)
         self.assertIn("GXKKeyIsVisible(v, root)", find)
         update = function_body(self.popup, "static void GXKPunctPopupUpdate(UIViewController *vc) {")
-        self.assertIn("GXKPunctKeyMatches(key) &&", update)
+        self.assertIn("GXKPunctGestureIsAttached(key, root)", update)
+
+    def test_digit_gesture_uses_the_touch_receiving_collection_only_for_punctuation(self) -> None:
+        # 数字 cell 不接触摸，不能只给内层 key 挂手势；也不能开启 cell 或吞掉普通数字。
+        host = function_body(self.popup, "static UIView *GXKPunctGestureHostForKey(")
+        self.assertIn("GXKPunctPagePinyin", host)
+        self.assertIn("return key.userInteractionEnabled ? key : nil", host)
+        self.assertIn("GKBSoftKeyCollectionView", host)
+        self.assertIn("key.superview", host)
+        self.assertIn("cursor != body", host)
+        attach = function_body(self.popup, "static void GXKPunctAttach(")
+        self.assertIn("[host addGestureRecognizer:gr]", attach)
+        self.assertNotIn("[key addGestureRecognizer:gr]", attach)
+        self.assertIn("gr.delegate = gPunctTarget", attach)
+        self.assertIn("gr.delaysTouchesBegan = NO", attach)
+        receive = function_body(self.popup, "- (BOOL)gestureRecognizer:")
+        self.assertIn("[touch locationInView:key]", receive)
+        self.assertIn("CGRectContainsPoint(key.bounds, point)", receive)
+        self.assertIn("return accept", receive)
+        live = function_body(self.popup, "static BOOL GXKPunctGestureIsAttached(")
+        self.assertIn("gr.view == host", live)
+        self.assertIn("[host.gestureRecognizers containsObject:gr]", live)
+        self.assertIn("objc_getAssociatedObject(key, GXK_PUNCT_ASSOC_KEY) == gr", live)
+        self.assertNotIn("userInteractionEnabled = YES", host + attach)
 
     def test_digit_page_does_not_share_symbol_page_identity_or_return(self) -> None:
         pages = (ROOT / "dylib" / "keyboard_page_identity.h").read_text(encoding="utf-8")

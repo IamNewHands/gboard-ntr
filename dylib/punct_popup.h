@@ -17,7 +17,7 @@
 #define GXK_PUNCT_POPUP_H
 
 #define GXK_PUNCT_KEY_IDENT    @"key_pos_9keys_4_1" // 拼音页原生固定键位
-#define GXK_PUNCT_DIGIT_KEY_DEF @"softkey_9keys_punctuation_candidates" // 数字页模型的精确 id_p
+#define GXK_PUNCT_KEY_DEF      @"softkey_9keys_punctuation_candidates" // 两页共用的精确 id_p，不代表分页
 #define GXK_PUNCT_HOLD_DELAY   0.32   // 长按判定阈值：低于原生 0.5s，手感更跟手
 #define GXK_PUNCT_CELL_MAX     44.0   // 单格最大宽度，超出则整排按可用宽度均分
 #define GXK_PUNCT_PANEL_HEIGHT 42.0
@@ -28,12 +28,13 @@
 #define GXK_PUNCT_DIGIT_COUNT_KEY   @"GXKPunctDigitCount"   // App Group：数字页显示前几个
 #define GXK_PUNCT_MAX_SYMBOLS  10                 // 上限沿用原版 10 格：375pt 宽键盘单格仍有 37pt
 
-// 拼音页这一格的 restorationIdentifier 是 key_pos_9keys_4_1，123 数字页那一格**没有** ident
-// （真机核对：数字页 24 个可见软键只有 8 个带 ident，4_1 不在其中）。两页绑的 softKeyDef 也不同：
-// 拼音页是 softkey_9keys_comma（显示「，」），数字页是 softkey_9keys_punctuation_candidates（显示 ",.;"）。
-// 拼音页保留固定键位；数字页读取 softKeyDef.id_p，不依赖键帽渲染/无障碍文本。
+// 拼音页固定键位为 key_pos_9keys_4_1；数字页的集合单元格内键没有 ident。
+// 真机已确认两页共用 softkey_9keys_punctuation_candidates，所以模型 ID 只用于找键，
+// 分页只认 Helper 本轮实际加载的 layout（keyboard_page_identity.h 的同一身份来源）。
+// 数字页原生 cell 的 interaction=NO；它的内层 key 不接 UIKit 触摸，手势必须挂 collection。
 // 两页的符号表与显示个数分开存：改数字页不影响拼音页，反之亦然。
 typedef NS_ENUM(NSInteger, GXKPunctPage) {
+    GXKPunctPageUnknown = -1,
     GXKPunctPagePinyin = 0,
     GXKPunctPageDigit = 1,
 };
@@ -195,16 +196,47 @@ static NSString *GXKPunctKeyDefinitionID(UIView *key) {
     return [name isKindOfClass:[NSString class]] ? name : nil;
 }
 
-static BOOL GXKPunctKeyMatches(UIView *key) {
-    if (!key) return NO;
-    if ([GXKPunctKeyDefinitionID(key) isEqualToString:GXK_PUNCT_DIGIT_KEY_DEF]) return YES;
-    return [key.restorationIdentifier isEqualToString:GXK_PUNCT_KEY_IDENT];
+// 两页共用标点模型，不能据此把拼音页误判成数字页；未知/符号布局不接管。
+static GXKPunctPage GXKPunctPageForKey(UIView *key) {
+    GXKNineKeyPage page = GXKNineKeyPageForView(key);
+    if (page == GXKNineKeyPagePinyin) return GXKPunctPagePinyin;
+    if (page == GXKNineKeyPageDigit) return GXKPunctPageDigit;
+    return GXKPunctPageUnknown;
 }
 
-// 只对已经命中的目标键定页：数字页读精确模型 ID，拼音页沿用原生固定键位。
-static GXKPunctPage GXKPunctPageForKey(UIView *key) {
-    return [GXKPunctKeyDefinitionID(key) isEqualToString:GXK_PUNCT_DIGIT_KEY_DEF]
-        ? GXKPunctPageDigit : GXKPunctPagePinyin;
+static BOOL GXKPunctKeyMatches(UIView *key) {
+    GXKPunctPage page = GXKPunctPageForKey(key);
+    if (page == GXKPunctPagePinyin)
+        return [key.restorationIdentifier isEqualToString:GXK_PUNCT_KEY_IDENT];
+    return page == GXKPunctPageDigit &&
+        [GXKPunctKeyDefinitionID(key) isEqualToString:GXK_PUNCT_KEY_DEF];
+}
+
+static Class gPunctCollectionClass;
+
+// 2.3.19 的 collectionView:cellForItemAtIndexPath: 对 cell 设置 interaction=NO。
+// 拼音页沿用独立 key；数字页只把同一长按手势移到实际接收触摸的原生 collection，
+// 不开启 cell 交互，不覆盖按钮，也不 swizzle touchesBegan/Moved/Ended/Cancelled。
+static UIView *GXKPunctGestureHostForKey(UIView *key, UIView *root) {
+    if (!key || !root || !GXKPunctKeyMatches(key) || !GXKKeyIsVisible(key, root)) return nil;
+    if (GXKPunctPageForKey(key) == GXKPunctPagePinyin) return key.userInteractionEnabled ? key : nil;
+    Class collectionClass = GXKClassCached(@"GKBSoftKeyCollectionView", &gPunctCollectionClass);
+    UIView *body = GXKNineKeyBodyForKey(key, root);
+    if (!collectionClass || !body) return nil;
+    for (UIView *cursor = key.superview; cursor && cursor != body; cursor = cursor.superview) {
+        if ([cursor isKindOfClass:collectionClass])
+            return (cursor.userInteractionEnabled && GXKKeyIsVisible(cursor, root)) ? cursor : nil;
+    }
+    return nil;
+}
+
+// 原生复用可能移走 recognizer；key 上残留的关联对象不是“仍挂着”的证据。
+static BOOL GXKPunctGestureIsAttached(UIView *key, UIView *root) {
+    UIView *host = GXKPunctGestureHostForKey(key, root);
+    UILongPressGestureRecognizer *gr = gPunctGesture;
+    return host && key == gPunctKey && root == gPunctRoot && gr && gr.enabled &&
+        gr.view == host && objc_getAssociatedObject(key, GXK_PUNCT_ASSOC_KEY) == gr &&
+        [host.gestureRecognizers containsObject:gr];
 }
 
 // 两个可见同款则保持原生；只定位九键体中的真实目标键，不改普通点击与滑行输入。
@@ -410,16 +442,33 @@ static void GXKPunctCommit(NSInteger index) {
                     (long)(gPunctPreText ? gPunctPreText.length : -1), (long)now.length);
 }
 
-@interface GXKPunctGestureTarget : NSObject
+@interface GXKPunctGestureTarget : NSObject <UIGestureRecognizerDelegate>
 - (void)onPunctLongPress:(UILongPressGestureRecognizer *)gr;
 @end
 
 @implementation GXKPunctGestureTarget
-- (void)onPunctLongPress:(UILongPressGestureRecognizer *)gr {
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gr shouldReceiveTouch:(UITouch *)touch {
+    UIView *key = gPunctKey;
     UIView *root = gPunctRoot;
-    // [DIAG-punct] 状态迁移就是「完全无反应」的分水岭：一条 Began 都没有 = 手势从未识别。
-    GXKPunctDiagLog(@"lp state=%ld root=%d", (long)gr.state, root != nil);
-    if (!root) { GXKPunctHidePanel(); return; }
+    if (gr != gPunctGesture || !GXKPunctGestureIsAttached(key, root)) return NO;
+    // collection 覆盖全部数字，但只允许从当前标点格开始；其他格直接保留原生触摸链。
+    CGPoint point = [touch locationInView:key];
+    BOOL accept = CGRectContainsPoint(key.bounds, point);
+    if (GXKPunctDiagEnabled()) {
+        GXKPunctDiagLog(@"touch page=%ld host=%@ hit=%@ accept=%d p=(%.0f,%.0f)",
+                        (long)GXKPunctPageForKey(key), NSStringFromClass(gr.view.class),
+                        NSStringFromClass(touch.view.class), (int)accept, point.x, point.y);
+    }
+    return accept;
+}
+
+- (void)onPunctLongPress:(UILongPressGestureRecognizer *)gr {
+    if (gr != gPunctGesture) return; // 旧 recognizer 的取消回调不能影响新分页弹层。
+    UIView *root = gPunctRoot;
+    // [DIAG-punct] touch 是实际触摸入口，lp 才是识别成功；两页共用这两条诊断路径。
+    GXKPunctDiagLog(@"lp state=%ld root=%d page=%ld", (long)gr.state, root != nil, (long)gPunctPage);
+    if (!root || !GXKPunctGestureIsAttached(gPunctKey, root) ||
+        GXKPunctPageForKey(gPunctKey) != gPunctPage) { GXKPunctHidePanel(); return; }
     if (gr.state == UIGestureRecognizerStateBegan) {
         gPunctPage = GXKPunctPageForKey(gPunctKey); // 先认页，再按这一页的表建格子
         GXKPunctBuildPanelIfNeeded();
@@ -469,6 +518,8 @@ static void GXKPunctDetach(void) {
 }
 
 static void GXKPunctAttach(UIView *key, UIView *root) {
+    UIView *host = GXKPunctGestureHostForKey(key, root);
+    if (!host) return;
     if (!gPunctTarget) gPunctTarget = [[GXKPunctGestureTarget alloc] init];
     UILongPressGestureRecognizer *gr =
         [[UILongPressGestureRecognizer alloc] initWithTarget:gPunctTarget
@@ -479,21 +530,24 @@ static void GXKPunctAttach(UIView *key, UIView *root) {
     gr.cancelsTouchesInView = YES;
     gr.delaysTouchesBegan = NO;
     gr.delaysTouchesEnded = NO;
-    [key addGestureRecognizer:gr];
+    gr.delegate = gPunctTarget;
     objc_setAssociatedObject(key, GXK_PUNCT_ASSOC_KEY, gr, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     gPunctGesture = gr;
     gPunctKey = key;
     gPunctRoot = root;
-    gPunctPage = GXKPunctPageForKey(key); // 挂手势时就定页，长按那一拍不用再判
-    // [DIAG-punct] 手势真的挂上了没有：UI 交互开关、已有手势数、可见性、九键体。
+    gPunctPage = GXKPunctPageForKey(key);
+    [host addGestureRecognizer:gr];
+    // [DIAG-punct] 同时记录视觉键与真实触摸宿主，不能只靠内部 key 的 uie=1 判断。
     gDiagAttach++;
-    CGRect r = [key convertRect:key.bounds toView:root];
-    GXKPunctDiagLog(@"att ident=%@ def=%@ cls=%@ f=(%.0f,%.0f,%.0f,%.0f) uie=%d ges=%lu inBody=%d vis=%d",
-                    key.restorationIdentifier ?: @"nil", GXKPunctKeyDefinitionID(key) ?: @"nil",
-                    NSStringFromClass(key.class),
-                    r.origin.x, r.origin.y, r.size.width, r.size.height,
-                    (int)key.userInteractionEnabled, (unsigned long)key.gestureRecognizers.count,
-                    GXKNineKeyBodyForKey(key, root) != nil, (int)GXKKeyIsVisible(key, root));
+    if (GXKPunctDiagEnabled()) {
+        CGRect r = [key convertRect:key.bounds toView:root];
+        GXKPunctDiagLog(@"att ident=%@ def=%@ page=%ld cls=%@ host=%@ f=(%.0f,%.0f,%.0f,%.0f) uie=%d ges=%lu inBody=%d vis=%d",
+                        key.restorationIdentifier ?: @"nil", GXKPunctKeyDefinitionID(key) ?: @"nil",
+                        (long)gPunctPage, NSStringFromClass(key.class), NSStringFromClass(host.class),
+                        r.origin.x, r.origin.y, r.size.width, r.size.height,
+                        (int)host.userInteractionEnabled, (unsigned long)host.gestureRecognizers.count,
+                        GXKNineKeyBodyForKey(key, root) != nil, (int)GXKKeyIsVisible(key, root));
+    }
 }
 
 // 布局拍里调用：至多一次全树定位，键没变时只做一次指针比较。
@@ -504,12 +558,9 @@ static void GXKPunctPopupUpdate(UIViewController *vc) {
     GXKPunctDiagHud();
     // 常数级快路径：上一帧的键仍然在同一次布局里、仍然可见、手势还在，就不扫全树。
     UIView *key = gPunctKey;
-    if (key && gPunctRoot == root && key.window == root.window && !key.isHidden && key.alpha > 0.05 &&
-        GXKPunctKeyMatches(key) &&
-        [key isDescendantOfView:root] && GXKKeyIsVisible(key, root) &&
-        objc_getAssociatedObject(key, GXK_PUNCT_ASSOC_KEY)) {
+    if (GXKPunctGestureIsAttached(key, root)) {
         if (gPunctPanel && gPunctPanel.superview != root) [root addSubview:gPunctPanel];
-        // 原生复用键体时按当前模型重算符号表，手势无需重复挂载。
+        // 原生复用键体时按当前加载的分页重算符号表，不按共用模型猜页。
         GXKPunctPage page = GXKPunctPageForKey(key);
         if (page != gPunctPage) {
             gPunctPage = page;
@@ -530,11 +581,6 @@ static void GXKPunctPopupUpdate(UIViewController *vc) {
                                       gPunctKey.restorationIdentifier ?: @"nil",
                                       GXKPunctKeyDefinitionID(gPunctKey) ?: @"nil");
         GXKPunctDetach();
-        return;
-    }
-    if (gPunctKey == found) {
-        // 键没换，只是这一拍没走快路径：手势已经在键上，重建等于白删白挂一次。
-        if (gPunctPanel && gPunctPanel.superview != root) [root addSubview:gPunctPanel];
         return;
     }
     GXKPunctDiagLog(@"hit new key %@ def=%@", found.restorationIdentifier ?: @"nil",

@@ -656,9 +656,13 @@ class PerfContracts(unittest.TestCase):
         """键没换就别 detach+attach：白删白挂一次手势，还多扫一遍全树。"""
         popup = (ROOT / "dylib/punct_popup.h").read_text(encoding="utf-8")
         update = function_body(popup, "static void GXKPunctPopupUpdate(UIViewController *vc) {")
-        same = update[update.index("if (gPunctKey == found) {"):]
-        self.assertLess(same.index("if (gPunctKey == found) {"), same.index("GXKPunctDetach();"))
-        self.assertLess(same.index("if (gPunctKey == found) {"), same.index("GXKPunctAttach(found, root);"))
+        fast = update[:update.index("UIView *found = GXKPunctFindKey(root);")]
+        self.assertIn("if (GXKPunctGestureIsAttached(key, root)) {", fast)
+        self.assertIn("return;", fast)
+        self.assertNotIn("GXKPunctDetach();", fast)
+        recovery = update[update.index("UIView *found = GXKPunctFindKey(root);"):]
+        self.assertLess(recovery.index("GXKPunctDetach();"), recovery.index("GXKPunctAttach(found, root);"))
+        self.assertNotIn("if (gPunctKey == found", recovery)
 
     def test_punct_diag_bookkeeping_is_off_by_default(self):
         """诊断关闭时不能建 ident 数组、不能 containsObject、不能拼日志字符串。"""
